@@ -242,8 +242,8 @@ type GossipSubParams struct {
 }
 
 // NewGossipSub returns a new PubSub object using the default GossipSubRouter as the router.
-func NewGossipSub(ctx context.Context, h host.Host, opts ...Option) (*PubSub, error) {
-	rt := DefaultGossipSubRouter(h)
+func NewGossipSub(ctx context.Context, h host.Host, gossipProtocolChoice GossipProtocolChoice, opts ...Option) (*PubSub, error) {
+	rt := DefaultGossipSubRouter(h, gossipProtocolChoice)
 	opts = append(opts, WithRawTracer(rt.tagTracer))
 	return NewGossipSubWithRouter(ctx, h, rt, opts...)
 }
@@ -254,8 +254,17 @@ func NewGossipSubWithRouter(ctx context.Context, h host.Host, rt PubSubRouter, o
 }
 
 // DefaultGossipSubRouter returns a new GossipSubRouter with default parameters.
-func DefaultGossipSubRouter(h host.Host) *GossipSubRouter {
+func DefaultGossipSubRouter(h host.Host, gossipProtocolChoice GossipProtocolChoice) *GossipSubRouter {
 	params := DefaultGossipSubParams()
+
+	hierarchicalDataProvider := NewHierarchicalDataProvider(h.ID())
+	hierarchicalGossip := NewHierarchicalGossip(&HierarchicalGossipConfig{
+			IntraFanout: INTRA_FANOUT,
+				InterFanout: INTER_FANOUT,
+				IntraRho: INTRA_RHO,
+				InterProb: INTER_PROB,
+			}, hierarchicalDataProvider)
+
 	return &GossipSubRouter{
 		peers:        make(map[peer.ID]protocol.ID),
 		mesh:         make(map[string]map[peer.ID]struct{}),
@@ -276,6 +285,8 @@ func DefaultGossipSubRouter(h host.Host) *GossipSubRouter {
 		feature:      GossipSubDefaultFeatures,
 		tagTracer:    newTagTracer(h.ConnManager()),
 		params:       params,
+		hierarchicalGossip: hierarchicalGossip,
+		gossipProtocolChoice: gossipProtocolChoice,
 	}
 }
 
@@ -521,6 +532,12 @@ type GossipSubRouter struct {
 	// number of heartbeats since the beginning of time; this allows us to amortize some resource
 	// clean up -- eg backoff clean up.
 	heartbeatTicks uint64
+
+	// Hierarchical gossip
+	hierarchicalGossip *HierarchicalGossip
+
+	// GossipProtocolChoice
+	gossipProtocolChoice GossipProtocolChoice
 }
 
 var _ BatchPublisher = &GossipSubRouter{}
@@ -792,7 +809,7 @@ func (gs *GossipSubRouter) handleIHave(p peer.ID, ctl *pb.ControlMessage) []*pb.
 			continue
 		}
 
-	checkIwantMsgsLoop:
+checkIwantMsgsLoop:
 		for msgIdx, mid := range ihave.GetMessageIDs() {
 			// prevent remote peer from sending too many msg_ids on a single IHAVE message
 			if msgIdx >= gs.params.MaxIHaveLength {
@@ -1235,6 +1252,18 @@ func (gs *GossipSubRouter) rpcs(msg *Message) iter.Seq2[peer.ID, *RPC] {
 			}
 		}
 
+		if gs.gossipProtocolChoice == HIERARCHICAL_GOSSIP {
+			tosend = make(map[peer.ID]struct{})
+			for _, peer := range gs.hierarchicalGossip.forwardingPeers {
+				// don't send to sender
+				if peer == from {
+					continue
+				}
+
+				tosend[peer] = struct{}{}
+			}
+		}
+
 		out := rpcWithMessages(msg.Message)
 		for pid := range tosend {
 			if pid == from || pid == peer.ID(msg.GetFrom()) {
@@ -1301,7 +1330,7 @@ func (gs *GossipSubRouter) Join(topic string) {
 	for p := range gmap {
 		log.Debugf("JOIN: Add mesh link to %s in %s", p, topic)
 		gs.tracer.Graft(p, topic)
-		gs.sendGraft(p, topic)
+			gs.sendGraft(p, topic)
 	}
 }
 
