@@ -278,8 +278,8 @@ func (params *GossipSubParams) validate() error {
 }
 
 // NewGossipSub returns a new PubSub object using the default GossipSubRouter as the router.
-func NewGossipSub(ctx context.Context, h host.Host, opts ...Option) (*PubSub, error) {
-	rt := DefaultGossipSubRouter(h)
+func NewGossipSub(ctx context.Context, h host.Host, gossipProtocolChoice GossipProtocolChoice, opts ...Option) (*PubSub, error) {
+	rt := DefaultGossipSubRouter(h, gossipProtocolChoice)
 	opts = append(opts, WithRawTracer(rt.tagTracer))
 	return NewGossipSubWithRouter(ctx, h, rt, opts...)
 }
@@ -290,8 +290,17 @@ func NewGossipSubWithRouter(ctx context.Context, h host.Host, rt PubSubRouter, o
 }
 
 // DefaultGossipSubRouter returns a new GossipSubRouter with default parameters.
-func DefaultGossipSubRouter(h host.Host) *GossipSubRouter {
+func DefaultGossipSubRouter(h host.Host, gossipProtocolChoice GossipProtocolChoice) *GossipSubRouter {
 	params := DefaultGossipSubParams()
+
+	hierarchicalDataProvider := NewHierarchicalDataProvider(h.ID())
+	hierarchicalGossip := NewHierarchicalGossip(&HierarchicalGossipConfig{
+		IntraFanout: INTRA_FANOUT,
+		InterFanout: INTER_FANOUT,
+		IntraRho:    INTRA_RHO,
+		InterProb:   INTER_PROB,
+	}, hierarchicalDataProvider)
+
 	rt := &GossipSubRouter{
 		peers:           make(map[peer.ID]protocol.ID),
 		mesh:            make(map[string]map[peer.ID]struct{}),
@@ -313,6 +322,9 @@ func DefaultGossipSubRouter(h host.Host) *GossipSubRouter {
 		tagTracer:       newTagTracer(h.ConnManager()),
 		params:          params,
 		reducePXRecords: defaultPXRecordReducer,
+		// SPREAD params
+		hierarchicalGossip:   hierarchicalGossip,
+		gossipProtocolChoice: gossipProtocolChoice,
 	}
 
 	rt.extensions = newExtensionsState(PeerExtensions{}, func(p peer.ID) {
@@ -646,6 +658,12 @@ type GossipSubRouter struct {
 	// number of heartbeats since the beginning of time; this allows us to amortize some resource
 	// clean up -- eg backoff clean up.
 	heartbeatTicks uint64
+
+	// Hierarchical gossip
+	hierarchicalGossip *HierarchicalGossip
+
+	// GossipProtocolChoice
+	gossipProtocolChoice GossipProtocolChoice
 }
 
 var _ BatchPublisher = &GossipSubRouter{}
@@ -1373,6 +1391,18 @@ func (gs *GossipSubRouter) rpcs(msg *Message) iter.Seq2[peer.ID, *RPC] {
 					continue
 				}
 				tosend[p] = struct{}{}
+			}
+		}
+
+		if gs.gossipProtocolChoice == HIERARCHICAL_GOSSIP {
+			tosend = make(map[peer.ID]struct{})
+			for _, peer := range gs.hierarchicalGossip.forwardingPeers {
+				// don't send to sender
+				if peer == from {
+					continue
+				}
+
+				tosend[peer] = struct{}{}
 			}
 		}
 
