@@ -181,6 +181,12 @@ func NewHierarchicalDataProvider(selfPeerID peer.ID) *HierarchicalDataProvider {
 	clusterPeers := CreateClusterPeersMap(nodePeerID)
 	clusterIndex := CreateClusterIndexMap(clusterPeers)
 
+	fmt.Println("nodePeerID:", nodePeerID)
+	fmt.Println("clusterPeers:", clusterPeers)
+	fmt.Println("clusterIndex:", clusterIndex)
+
+	fmt.Println("selfPeerID:", selfPeerID)
+	fmt.Println("selfClusterID:", clusterIndex[selfPeerID])
 	// Get self cluster ID
 	selfClusterID := clusterIndex[selfPeerID]
 
@@ -202,7 +208,7 @@ func (hdp *HierarchicalDataProvider) GetPeersFromClusterID(clusterID ClusterID) 
 		fmt.Printf("HierarchicalDataProvider: No peers found for cluster %d\n", clusterID)
 		return nil
 	}
-	fmt.Printf("HierarchicalDataProvider: Returning %d peers from cluster %d: %v\n", len(peers), clusterID, peers)
+	// fmt.Printf("HierarchicalDataProvider: Returning %d peers from cluster %d: %v\n", len(peers), clusterID, peers)
 	return peers
 }
 
