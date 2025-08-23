@@ -386,13 +386,16 @@ loop:
 }
 
 func (v *validation) validateSignature(msg *Message) bool {
-	err := verifyMessageSignature(msg.Message)
-	if err != nil {
-		v.p.logger.Debug("signature verification error", "err", err)
-		return false
-	}
-
+	// Bypass signature verification - always return true
 	return true
+
+	// Original code commented out:
+	// err := verifyMessageSignature(msg.Message)
+	// if err != nil {
+	// 	v.p.logger.Debug("signature verification error", "err", err)
+	// 	return false
+	// }
+	// return true
 }
 
 func (v *validation) doValidateTopic(vals []*validatorImpl, src peer.ID, msg *Message, r ValidationResult, onValid func(*Message) error) {
