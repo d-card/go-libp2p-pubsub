@@ -9,6 +9,10 @@ import (
 	"strconv"
 	"strings"
 
+	"net"
+
+	ip2location "github.com/ip2location/ip2location-go/v9"
+	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 
@@ -107,93 +111,153 @@ func CreateNodePeerIDMap() map[NodeID]peer.ID {
 }
 
 
-func CreateClusterPeersMap(nodePeerID map[NodeID]peer.ID) map[ClusterID][]peer.ID {
-	clusterPeers := make(map[ClusterID][]peer.ID)
 
-	_, filename, _, ok := runtime.Caller(0)
-	if !ok {
-		log.Fatalf("Failed to get current file path")
+
+const (
+	ClusterEurope ClusterID = iota
+	ClusterEastNA
+	ClusterWestNA
+	ClusterSA
+	ClusterAfrica
+	ClusterEastAsia
+	ClusterWestAsia
+	ClusterOceania
+)
+
+func regionToCluster(country, region string, longitude float64) ClusterID {
+	switch country {
+	case "US", "CA":
+		// Split NA by longitude (roughly at -100)
+		if longitude > -100 {
+			return ClusterEastNA
+		} else {
+			return ClusterWestNA
+		}
+	case "MX":
+		return ClusterWestNA
+	case "BR", "AR", "CL", "CO", "PE", "VE", "EC", "BO", "PY", "UY", "SR", "GF", "GY":
+		return ClusterSA
+	case "ZA", "NG", "EG", "DZ", "MA", "KE", "ET", "GH", "TZ", "UG", "SD", "AO", "CM", "CI", "SN", "TN", "ZW", "MZ", "MW", "NE", "BF", "ML", "ZM", "RW", "SO", "GN", "BJ", "BI", "TG", "SL", "TD", "CG", "LY", "LR", "GA", "MR", "SZ", "GQ", "GW", "LS", "DJ", "KM", "SC", "ST", "CV":
+		return ClusterAfrica
+	case "AU", "NZ", "FJ", "PG", "SB", "VU", "NC", "WS", "TO", "KI", "FM", "MH", "PW":
+		return ClusterOceania
+	case "CN", "JP", "KR", "TW", "MN":
+		return ClusterEastAsia
+	case "IN", "PK", "BD", "LK", "NP", "AF", "UZ", "TM", "TJ", "KG":
+		return ClusterWestAsia
+    case "AL", "AD", "AT", "BY", "BE", "BA", "BG", "HR", "CY", "CZ", "DK", "EE", "FI", "FR", "DE", "GR", "HU", "IS", "IE", "IT", "LV", "LI", "LT", "LU", "MT", "MD", "MC", "ME", "NL", "MK", "NO", "PL", "PT", "RO", "SM", "RS", "SK", "SI", "ES", "SE", "CH", "UA", "GB", "VA":
+        return ClusterEurope
 	}
-	libDir := filepath.Dir(filename)
+	if country == "RU" {
+		if longitude > 90 {
+			return ClusterEastAsia
+		} else {
+			return ClusterWestAsia
+		}
+	}
+	if region == "Europe" {
+		return ClusterEurope
+	}
+	if region == "Asia" {
+		if longitude > 90 {
+			return ClusterEastAsia
+		} else {
+			return ClusterWestAsia
+		}
+	}
+	if region == "Africa" {
+		return ClusterAfrica
+	}
+	if region == "Oceania" {
+		return ClusterOceania
+	}
+	if region == "South America" {
+		return ClusterSA
+	}
+	if region == "North America" {
+		if longitude > -100 {
+			return ClusterEastNA
+		} else {
+			return ClusterWestNA
+		}
+	}
+	// Fallback
+	return ClusterEurope
+}
 
-	fname := filepath.Join(libDir, "hierarchical_data", "clusters.txt")
-	file, err := os.Open(fname)
+func NewHierarchicalDataProvider(selfPeerID peer.ID, h host.Host) *HierarchicalDataProvider {
+	db, err := ip2location.OpenDB("./IP2LOCATION-LITE-DB1.BIN")
 	if err != nil {
-		log.Fatalf("Failed to open file: %v", err)
+		panic(fmt.Sprintf("Failed to open IP2Location DB: %v", err))
 	}
-	defer file.Close()
+	defer db.Close()
 
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		// Line format: <ClusterID>:<NodeID>[, <NodeID>]*
-		line := scanner.Text()
-		parts := strings.Split(line, ":")
-		if len(parts) < 2 {
+    nodePeerID := CreateNodePeerIDMap()
+
+    // Build peerID to IP map for participants only
+    peerIDToIP := make(map[peer.ID]string)
+    for _, p := range nodePeerID {
+        if p == selfPeerID {
+            // Get our own external IP from listen addresses
+            for _, addr := range h.Addrs() {
+                ip := addrToIP(addr.String())
+                if ip != "" && !isPrivateIP(ip) {
+                    peerIDToIP[p] = ip
+                    break
+                }
+            }
+        } else {
+            addrs := h.Peerstore().Addrs(p)
+            for _, addr := range addrs {
+                ip := addrToIP(addr.String())
+                if ip != "" && !isPrivateIP(ip) {
+                    peerIDToIP[p] = ip
+                    break
+                }
+            }
+        }
+    }
+
+	clusterPeers := make(map[ClusterID][]peer.ID)
+	selfClusterID := ClusterID(-1)
+	for pid, ip := range peerIDToIP {
+		res, err := db.Get_all(ip)
+		if err != nil {
+			fmt.Printf("Failed to geolocate IP %s: %v\n", ip, err)
 			continue
 		}
-		// Convert parts[0] from string to ClusterID
-		clusterIDInt, err := strconv.Atoi(parts[0])
-		if err != nil {
-			panic(err)
-		}
-		clusterID := ClusterID(clusterIDInt)
-		clusterPeers[clusterID] = make([]peer.ID, 0)
-
-		nodeIDs := strings.Split(parts[1], ",") // {"1", "2", "3", ...}
-		for _, nodeID := range nodeIDs {
-			// Transform nodeID from string to NodeID
-			nodeIDInt, err := strconv.Atoi(strings.TrimSpace(nodeID))
-			if err != nil {
-				panic(err)
-			}
-			nodeIDTyped := NodeID(nodeIDInt)
-			
-			// Only include peers that exist in the filtered nodePeerID map
-			if peerID, exists := nodePeerID[nodeIDTyped]; exists {
-				clusterPeers[clusterID] = append(clusterPeers[clusterID], peerID)
-			}
+		cluster := regionToCluster(res.Country_short, res.Region, res.Longitude)
+		clusterPeers[cluster] = append(clusterPeers[cluster], pid)
+		if pid == selfPeerID {
+			selfClusterID = cluster
 		}
 	}
-
-	if err := scanner.Err(); err != nil {
-		log.Fatalf("Failed to read file: %v", err)
-	}
-
-	return clusterPeers
-}
-
-func CreateClusterIndexMap(clusterPeers map[ClusterID][]peer.ID) map[peer.ID]ClusterID {
-	clusterIndex := make(map[peer.ID]ClusterID)
-
-	// Iterate through clusterPeers to create a mapping from peer.ID to ClusterID
-	for clusterID, peers := range clusterPeers {
-		for _, peerID := range peers {
-			clusterIndex[peerID] = clusterID
-		}
-	}
-
-	return clusterIndex
-}
-
-func NewHierarchicalDataProvider(selfPeerID peer.ID) *HierarchicalDataProvider {
-
-	nodePeerID := CreateNodePeerIDMap()
-	clusterPeers := CreateClusterPeersMap(nodePeerID)
-	clusterIndex := CreateClusterIndexMap(clusterPeers)
-
-	fmt.Println("nodePeerID:", nodePeerID)
-	fmt.Println("clusterPeers:", clusterPeers)
-	fmt.Println("clusterIndex:", clusterIndex)
-
-	fmt.Println("selfPeerID:", selfPeerID)
-	fmt.Println("selfClusterID:", clusterIndex[selfPeerID])
-	// Get self cluster ID
-	selfClusterID := clusterIndex[selfPeerID]
 
 	return &HierarchicalDataProvider{
 		clusterPeers:  clusterPeers,
 		selfClusterID: selfClusterID,
 	}
+}
+
+func addrToIP(addr string) string {
+	parts := strings.Split(addr, "/")
+	for i := 0; i < len(parts)-1; i++ {
+		if parts[i] == "ip4" || parts[i] == "ip6" {
+			return parts[i+1]
+		}
+	}
+	return ""
+}
+
+func isPrivateIP(ip string) bool {
+	netIP := net.ParseIP(ip)
+	if netIP == nil {
+		return false
+	}
+	if netIP.IsLoopback() || netIP.IsPrivate() {
+		return true
+	}
+	return false
 }
 
 // Get own cluster ID
