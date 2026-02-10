@@ -13,6 +13,7 @@ import (
 	"time"
 
 	pb "github.com/libp2p/go-libp2p-pubsub/pb"
+	"google.golang.org/appengine/log"
 
 	"github.com/libp2p/go-libp2p/core/event"
 	"github.com/libp2p/go-libp2p/core/host"
@@ -278,8 +279,8 @@ func (params *GossipSubParams) validate() error {
 }
 
 // NewGossipSub returns a new PubSub object using the default GossipSubRouter as the router.
-func NewGossipSub(ctx context.Context, h host.Host, opts ...Option) (*PubSub, error) {
-	rt := DefaultGossipSubRouter(h)
+func NewGossipSub(ctx context.Context, h host.Host, gossipProtocolChoice GossipProtocolChoice, opts ...Option) (*PubSub, error) {
+	rt := DefaultGossipSubRouter(h, gossipProtocolChoice)
 	opts = append(opts, WithRawTracer(rt.tagTracer))
 	return NewGossipSubWithRouter(ctx, h, rt, opts...)
 }
@@ -290,8 +291,28 @@ func NewGossipSubWithRouter(ctx context.Context, h host.Host, rt PubSubRouter, o
 }
 
 // DefaultGossipSubRouter returns a new GossipSubRouter with default parameters.
-func DefaultGossipSubRouter(h host.Host) *GossipSubRouter {
+func DefaultGossipSubRouter(h host.Host, gossipProtocolChoice GossipProtocolChoice) *GossipSubRouter {
 	params := DefaultGossipSubParams()
+	var hierarchicalGossip *HierarchicalGossip = nil
+	var dandelionGossip *DandelionGossip = nil
+
+	if gossipProtocolChoice == HIERARCHICAL_GOSSIP {
+		hierarchicalDataProvider := NewHierarchicalDataProvider(h.ID())
+		hierarchicalGossip = NewHierarchicalGossip(&HierarchicalGossipConfig{
+			IntraFanout: INTRA_FANOUT,
+			InterFanout: INTER_FANOUT,
+			IntraRho:    INTRA_RHO,
+			InterProb:   INTER_PROB,
+		}, hierarchicalDataProvider)
+	}
+
+	if gossipProtocolChoice == DANDELION_GOSSIP {
+		dandelionGossip = NewDandelionGossip(&DandelionGossipConfig{
+			FANOUT: FANOUT,
+			PROB:   PROB,
+		})
+	}
+
 	rt := &GossipSubRouter{
 		peers:           make(map[peer.ID]protocol.ID),
 		mesh:            make(map[string]map[peer.ID]struct{}),
@@ -313,6 +334,10 @@ func DefaultGossipSubRouter(h host.Host) *GossipSubRouter {
 		tagTracer:       newTagTracer(h.ConnManager()),
 		params:          params,
 		reducePXRecords: defaultPXRecordReducer,
+		// SPREAD params
+		hierarchicalGossip:   hierarchicalGossip,
+		dandelionGossip:      dandelionGossip,
+		gossipProtocolChoice: gossipProtocolChoice,
 	}
 
 	rt.extensions = newExtensionsState(PeerExtensions{}, func(p peer.ID) {
@@ -646,6 +671,15 @@ type GossipSubRouter struct {
 	// number of heartbeats since the beginning of time; this allows us to amortize some resource
 	// clean up -- eg backoff clean up.
 	heartbeatTicks uint64
+
+	// Hierarchical gossip
+	hierarchicalGossip *HierarchicalGossip
+
+	// Dandelion gossip
+	dandelionGossip *DandelionGossip
+
+	// GossipProtocolChoice
+	gossipProtocolChoice GossipProtocolChoice
 }
 
 var _ BatchPublisher = &GossipSubRouter{}
@@ -1373,6 +1407,35 @@ func (gs *GossipSubRouter) rpcs(msg *Message) iter.Seq2[peer.ID, *RPC] {
 					continue
 				}
 				tosend[p] = struct{}{}
+			}
+		}
+
+		if gs.gossipProtocolChoice == HIERARCHICAL_GOSSIP {
+			tosend = make(map[peer.ID]struct{})
+			forwardingPeers := gs.hierarchicalGossip.GetForwardingPeers(from)
+			for _, peer := range forwardingPeers {
+				tosend[peer] = struct{}{}
+			}
+		}
+
+		if gs.gossipProtocolChoice == DANDELION_GOSSIP {
+			tosend = make(map[peer.ID]struct{})
+			// msg.Message.Data is of form: [MSG_NUMBER] from [SOURCE_NODE_ID] DandelionCoin [DANDELION_COIN]
+			// Read the DandelionCoin from the message
+			msgDandelionCoin, err := gs.dandelionGossip.ReadDandelionCoin(msg.Message.Data)
+			if err != nil {
+				log.Errorf("Failed to read DandelionCoin from message: %v", err)
+				return
+			}
+			forwardingPeers, newDandelionCoin := gs.dandelionGossip.GetForwardingPeers(from, gs.p.topics[topic], msgDandelionCoin)
+			for _, peer := range forwardingPeers {
+				tosend[peer] = struct{}{}
+			}
+
+			msg.Message.Data, err = gs.dandelionGossip.ReplaceDandelionCoin(msg.Message.Data, newDandelionCoin)
+			if err != nil {
+				log.Errorf("Failed to replace DandelionCoin in message: %v", err)
+				return
 			}
 		}
 
