@@ -279,8 +279,8 @@ func (params *GossipSubParams) validate() error {
 }
 
 // NewGossipSub returns a new PubSub object using the default GossipSubRouter as the router.
-func NewGossipSub(ctx context.Context, h host.Host, gossipProtocolChoice GossipProtocolChoice, opts ...Option) (*PubSub, error) {
-	rt := DefaultGossipSubRouter(h, gossipProtocolChoice)
+func NewGossipSub(ctx context.Context, h host.Host, opts ...Option) (*PubSub, error) {
+	rt := DefaultGossipSubRouter(h)
 	opts = append(opts, WithRawTracer(rt.tagTracer))
 	return NewGossipSubWithRouter(ctx, h, rt, opts...)
 }
@@ -291,27 +291,23 @@ func NewGossipSubWithRouter(ctx context.Context, h host.Host, rt PubSubRouter, o
 }
 
 // DefaultGossipSubRouter returns a new GossipSubRouter with default parameters.
-func DefaultGossipSubRouter(h host.Host, gossipProtocolChoice GossipProtocolChoice) *GossipSubRouter {
+func DefaultGossipSubRouter(h host.Host) *GossipSubRouter {
 	params := DefaultGossipSubParams()
 	var hierarchicalGossip *HierarchicalGossip = nil
 	var dandelionGossip *DandelionGossip = nil
 
-	if gossipProtocolChoice == HIERARCHICAL_GOSSIP {
-		hierarchicalDataProvider := NewHierarchicalDataProvider(h.ID())
-		hierarchicalGossip = NewHierarchicalGossip(&HierarchicalGossipConfig{
-			IntraFanout: INTRA_FANOUT,
-			InterFanout: INTER_FANOUT,
-			IntraRho:    INTRA_RHO,
-			InterProb:   INTER_PROB,
-		}, hierarchicalDataProvider)
-	}
+	hierarchicalDataProvider := NewHierarchicalDataProvider(h.ID())
+	hierarchicalGossip = NewHierarchicalGossip(&HierarchicalGossipConfig{
+		IntraFanout: INTRA_FANOUT,
+		InterFanout: INTER_FANOUT,
+		IntraRho:    INTRA_RHO,
+		InterProb:   INTER_PROB,
+	}, hierarchicalDataProvider)
 
-	if gossipProtocolChoice == DANDELION_GOSSIP {
-		dandelionGossip = NewDandelionGossip(&DandelionGossipConfig{
-			FANOUT: FANOUT,
-			PROB:   PROB,
-		})
-	}
+	dandelionGossip = NewDandelionGossip(&DandelionGossipConfig{
+		FANOUT: FANOUT,
+		PROB:   PROB,
+	})
 
 	rt := &GossipSubRouter{
 		peers:           make(map[peer.ID]protocol.ID),
@@ -335,9 +331,8 @@ func DefaultGossipSubRouter(h host.Host, gossipProtocolChoice GossipProtocolChoi
 		params:          params,
 		reducePXRecords: defaultPXRecordReducer,
 		// SPREAD params
-		hierarchicalGossip:   hierarchicalGossip,
-		dandelionGossip:      dandelionGossip,
-		gossipProtocolChoice: gossipProtocolChoice,
+		hierarchicalGossip: hierarchicalGossip,
+		dandelionGossip:    dandelionGossip,
 	}
 
 	rt.extensions = newExtensionsState(PeerExtensions{}, func(p peer.ID) {
@@ -385,6 +380,19 @@ func DefaultGossipSubParams() GossipSubParams {
 		IDontWantMessageThreshold: GossipSubIDontWantMessageThreshold,
 		IDontWantMessageTTL:       GossipSubIDontWantMessageTTL,
 		SlowHeartbeatWarning:      0.1,
+	}
+}
+
+// TODO: remember to use this to launch SPREAD.
+func WithProtocolChoice(choice GossipProtocolChoice) Option {
+	return func(p *PubSub) error {
+		// If p can be casted to GossipSub, set the protocol choice on the router.
+		gs, ok := p.rt.(*GossipSubRouter)
+		if !ok {
+			return fmt.Errorf("cannot set protocol choice since pubsub router is not gossipsub")
+		}
+		gs.gossipProtocolChoice = choice
+		return nil
 	}
 }
 
@@ -628,6 +636,10 @@ type GossipSubRouter struct {
 	connect      chan connectInfo                 // px connection requests
 	cab          peerstore.AddrBook
 
+	/*TODO:
+	- add SPREAD state: topics peers and clusters; propagation function; ip-ping estimator.
+	*/
+
 	protos  []protocol.ID
 	feature GossipSubFeatureTest
 
@@ -781,6 +793,7 @@ func (gs *GossipSubRouter) manageAddrBook() {
 	}
 }
 
+// TODO: guarantee added peer is added to SPREAD state if it has SPREAD extension.
 func (gs *GossipSubRouter) AddPeer(p peer.ID, proto protocol.ID, helloPacket *RPC) *RPC {
 	gs.logger.Debug("PEERUP: Add new peer using protocol", "peer", p, "protocol", proto)
 	gs.tracer.AddPeer(p, proto)
@@ -1341,6 +1354,12 @@ func (gs *GossipSubRouter) Publish(msg *Message) {
 	}
 }
 
+/*
+	TODO:
+
+- Look for SPREAD extension in message.
+  - If present, use SPREAD propagation. Else, use normal GossipSub propagation.
+*/
 func (gs *GossipSubRouter) rpcs(msg *Message) iter.Seq2[peer.ID, *RPC] {
 	return func(yield func(peer.ID, *RPC) bool) {
 		gs.mcache.Put(msg)

@@ -30,6 +30,8 @@ message RPC {
   // bytes
   optional TestExtension testExtension = 6492434;
 
+  // TODO: add spread extension here
+
 }
 
 message Message {
@@ -101,4 +103,9 @@ message PartialMessagesExtension {
 
   // An encoded representation of the parts a peer has and wants.
   optional bytes partsMetadata = 4;
+}
+
+// TODO: check if we need to define any extra data. Maybe Vivaldi?
+message SpreadExtension {
+  optional bool sourceIsSpreadNode = 1;
 }

@@ -6,9 +6,13 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 
+// TODO: rename to SPREAD
+// TODO: minimal clustering protocol (k-means or something simpler/faster)
+//TODO: virtual coordinate system implementation (random initial location, pings+vivaldi, or IP approach)
+
 const (
-	INTRA_FANOUT = 3 // Number of intra-cluster peers to select
-	INTER_FANOUT = 8 // Number of inter-cluster peers to select
+	INTRA_FANOUT = 3   // Number of intra-cluster peers to select
+	INTER_FANOUT = 8   // Number of inter-cluster peers to select
 	INTRA_RHO    = 0.6 // Probability of selecting intra-cluster peers
 	INTER_PROB   = 0.8 // Probability of selecting inter-cluster peers
 )
@@ -25,15 +29,15 @@ type HierarchicalGossipConfig struct {
 }
 
 type HierarchicalGossip struct {
-	config *HierarchicalGossipConfig
-	dataProvider *HierarchicalDataProvider
+	config          *HierarchicalGossipConfig
+	dataProvider    *HierarchicalDataProvider
 	meshEstablished bool
 }
 
 func NewHierarchicalGossip(config *HierarchicalGossipConfig, dataProvider *HierarchicalDataProvider) *HierarchicalGossip {
 	return &HierarchicalGossip{
-		config: config,
-		dataProvider: dataProvider,
+		config:          config,
+		dataProvider:    dataProvider,
 		meshEstablished: false,
 	}
 }
@@ -82,7 +86,7 @@ func (hg *HierarchicalGossip) GetForwardingPeers(from peer.ID) []peer.ID {
 	}
 
 	// fmt.Println("Forwarding peers:", forwardingPeers)
-	
+
 	return forwardingPeers
 }
 

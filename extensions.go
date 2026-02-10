@@ -145,6 +145,7 @@ func (es *extensionsState) RemovePeer(id peer.ID) {
 
 // extensionsAddPeer is only called once we've both sent and received the
 // extensions control message.
+// TODO: upon new peer, add it to spread's state, signaling it also runs SPREAD.
 func (es *extensionsState) extensionsAddPeer(id peer.ID) {
 	if es.myExtensions.TestExtension && es.peerExtensions[id].TestExtension {
 		es.testExtension.AddPeer(id)
