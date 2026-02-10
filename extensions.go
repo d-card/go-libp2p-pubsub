@@ -12,6 +12,7 @@ import (
 type PeerExtensions struct {
 	TestExtension   bool
 	PartialMessages bool
+	Spread          bool
 }
 
 type TestExtensionConfig struct {
@@ -43,6 +44,7 @@ func peerExtensionsFromRPC(rpc *RPC) PeerExtensions {
 	if hasPeerExtensions(rpc) {
 		out.TestExtension = rpc.Control.Extensions.GetTestExtension()
 		out.PartialMessages = rpc.Control.Extensions.GetPartialMessages()
+		out.Spread = rpc.Control.Extensions.GetSpread()
 	}
 	return out
 }
@@ -66,6 +68,15 @@ func (pe *PeerExtensions) ExtendRPC(rpc *RPC) *RPC {
 		}
 		rpc.Control.Extensions.PartialMessages = &pe.PartialMessages
 	}
+	if pe.Spread {
+		if rpc.Control == nil {
+			rpc.Control = &pubsub_pb.ControlMessage{}
+		}
+		if rpc.Control.Extensions == nil {
+			rpc.Control.Extensions = &pubsub_pb.ControlExtensions{}
+		}
+		rpc.Control.Extensions.Spread = &pe.Spread
+	}
 	return rpc
 }
 
@@ -78,6 +89,7 @@ type extensionsState struct {
 	testExtension     *testExtension
 
 	partialMessagesExtension *partialmessages.PartialMessagesExtension
+	spreadState              *SpreadState
 }
 
 func newExtensionsState(myExtensions PeerExtensions, reportMisbehavior func(peer.ID), sendRPC func(peer.ID, *RPC, bool)) *extensionsState {
@@ -88,6 +100,7 @@ func newExtensionsState(myExtensions PeerExtensions, reportMisbehavior func(peer
 		reportMisbehavior: reportMisbehavior,
 		sendRPC:           sendRPC,
 		testExtension:     nil,
+		spreadState:       NewSpreadState(),
 	}
 }
 
@@ -145,7 +158,6 @@ func (es *extensionsState) RemovePeer(id peer.ID) {
 
 // extensionsAddPeer is only called once we've both sent and received the
 // extensions control message.
-// TODO: upon new peer, add it to spread's state, signaling it also runs SPREAD.
 func (es *extensionsState) extensionsAddPeer(id peer.ID) {
 	if es.myExtensions.TestExtension && es.peerExtensions[id].TestExtension {
 		es.testExtension.AddPeer(id)
@@ -154,12 +166,19 @@ func (es *extensionsState) extensionsAddPeer(id peer.ID) {
 	if es.myExtensions.PartialMessages && es.peerExtensions[id].PartialMessages {
 		es.partialMessagesExtension.AddPeer(id)
 	}
+
+	if es.myExtensions.Spread && es.peerExtensions[id].Spread {
+		es.spreadState.AddPeer(id)
+	}
 }
 
 // extensionsRemovePeer is always called after extensionsAddPeer.
 func (es *extensionsState) extensionsRemovePeer(id peer.ID) {
 	if es.myExtensions.PartialMessages && es.peerExtensions[id].PartialMessages {
 		es.partialMessagesExtension.RemovePeer(id)
+	}
+	if es.myExtensions.Spread && es.peerExtensions[id].Spread {
+		es.spreadState.RemovePeer(id)
 	}
 }
 
@@ -170,6 +189,18 @@ func (es *extensionsState) extensionsHandleRPC(rpc *RPC) {
 
 	if es.myExtensions.PartialMessages && es.peerExtensions[rpc.from].PartialMessages && rpc.Partial != nil {
 		es.partialMessagesExtension.HandleRPC(rpc.from, rpc.Partial)
+	}
+
+	// Update SPREAD topic membership when peers announce subscriptions
+	if es.myExtensions.Spread && es.peerExtensions[rpc.from].Spread && rpc.Subscriptions != nil {
+		for _, sub := range rpc.GetSubscriptions() {
+			topic := sub.GetTopicid()
+			if sub.GetSubscribe() {
+				es.spreadState.AddPeerTopic(topic, rpc.from)
+			} else {
+				es.spreadState.RemovePeerTopic(topic, rpc.from)
+			}
+		}
 	}
 }
 

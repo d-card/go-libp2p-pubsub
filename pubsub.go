@@ -263,6 +263,7 @@ type Message struct {
 	ReceivedFrom  peer.ID
 	ValidatorData interface{}
 	Local         bool
+	Spread        bool
 }
 
 func (m *Message) GetFrom() peer.ID {
@@ -1418,7 +1419,11 @@ func (p *PubSub) handleIncomingRPC(rpc *RPC) {
 				continue
 			}
 
-			msg := &Message{Message: pmsg, ID: "", ReceivedFrom: rpc.from, ValidatorData: nil, Local: false}
+			msg := &Message{Message: pmsg, ID: "", ReceivedFrom: rpc.from, ValidatorData: nil, Local: false, Spread: false}
+			// If the enclosing RPC marks the publish as SPREAD, forward that marker to the internal message
+			if rpc.GetSpread() != nil {
+				msg.Spread = rpc.GetSpread().GetSourceIsSpreadNode()
+			}
 			if p.shouldPush(msg) {
 				toPush = append(toPush, msg)
 			}
