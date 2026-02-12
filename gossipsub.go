@@ -294,26 +294,27 @@ func DefaultGossipSubRouter(h host.Host) *GossipSubRouter {
 	params := DefaultGossipSubParams()
 
 	rt := &GossipSubRouter{
-		peers:           make(map[peer.ID]protocol.ID),
-		mesh:            make(map[string]map[peer.ID]struct{}),
-		fanout:          make(map[string]map[peer.ID]struct{}),
-		lastpub:         make(map[string]int64),
-		gossip:          make(map[peer.ID][]*pb.ControlIHave),
-		control:         make(map[peer.ID]*pb.ControlMessage),
-		backoff:         make(map[string]map[peer.ID]time.Time),
-		peerhave:        make(map[peer.ID]int),
-		peerdontwant:    make(map[peer.ID]int),
-		unwanted:        make(map[peer.ID]map[checksum]int),
-		iasked:          make(map[peer.ID]int),
-		outbound:        make(map[peer.ID]bool),
-		connect:         make(chan connectInfo, params.MaxPendingConnections),
-		cab:             pstoremem.NewAddrBook(),
-		mcache:          NewMessageCache(params.HistoryGossip, params.HistoryLength),
-		protos:          GossipSubDefaultProtocols,
-		feature:         GossipSubDefaultFeatures,
-		tagTracer:       newTagTracer(h.ConnManager()),
-		params:          params,
-		reducePXRecords: defaultPXRecordReducer,
+		peers:             make(map[peer.ID]protocol.ID),
+		mesh:              make(map[string]map[peer.ID]struct{}),
+		fanout:            make(map[string]map[peer.ID]struct{}),
+		lastpub:           make(map[string]int64),
+		gossip:            make(map[peer.ID][]*pb.ControlIHave),
+		control:           make(map[peer.ID]*pb.ControlMessage),
+		backoff:           make(map[string]map[peer.ID]time.Time),
+		peerhave:          make(map[peer.ID]int),
+		peerdontwant:      make(map[peer.ID]int),
+		unwanted:          make(map[peer.ID]map[checksum]int),
+		iasked:            make(map[peer.ID]int),
+		outbound:          make(map[peer.ID]bool),
+		connect:           make(chan connectInfo, params.MaxPendingConnections),
+		cab:               pstoremem.NewAddrBook(),
+		mcache:            NewMessageCache(params.HistoryGossip, params.HistoryLength),
+		protos:            GossipSubDefaultProtocols,
+		feature:           GossipSubDefaultFeatures,
+		tagTracer:         newTagTracer(h.ConnManager()),
+		params:            params,
+		reducePXRecords:   defaultPXRecordReducer,
+		spreadPropagation: NewSpreadPropagation(nil),
 	}
 
 	rt.extensions = newExtensionsState(PeerExtensions{}, func(p peer.ID) {
@@ -373,6 +374,18 @@ func WithProtocolChoice(choice GossipProtocolChoice) Option {
 			return fmt.Errorf("cannot set protocol choice since pubsub router is not gossipsub")
 		}
 		gs.gossipProtocolChoice = choice
+		return nil
+	}
+}
+
+// WithSpreadPropagationConfig configures SPREAD peer selection fanout/probability.
+func WithSpreadPropagationConfig(cfg *SpreadConfig) Option {
+	return func(ps *PubSub) error {
+		gs, ok := ps.rt.(*GossipSubRouter)
+		if !ok {
+			return fmt.Errorf("pubsub router is not gossipsub")
+		}
+		gs.spreadPropagation = NewSpreadPropagation(cfg)
 		return nil
 	}
 }
@@ -667,6 +680,9 @@ type GossipSubRouter struct {
 
 	// GossipProtocolChoice
 	gossipProtocolChoice GossipProtocolChoice
+
+	// SPREAD propagation selector.
+	spreadPropagation *SpreadPropagation
 }
 
 var _ BatchPublisher = &GossipSubRouter{}
@@ -1329,12 +1345,6 @@ func (gs *GossipSubRouter) Publish(msg *Message) {
 	}
 }
 
-/*
-	TODO:
-
-- Look for SPREAD extension in message.
-  - If present, use SPREAD propagation. Else, use normal GossipSub propagation.
-*/
 func (gs *GossipSubRouter) rpcs(msg *Message) iter.Seq2[peer.ID, *RPC] {
 	return func(yield func(peer.ID, *RPC) bool) {
 		gs.mcache.Put(msg)
@@ -1404,25 +1414,44 @@ func (gs *GossipSubRouter) rpcs(msg *Message) iter.Seq2[peer.ID, *RPC] {
 			}
 		}
 
-		// If this message was marked as SPREAD, override the default selection
-		// and select peers from the SPREAD propagation mechanism.
-		if msg.Spread {
-			tosend = make(map[peer.ID]struct{})
+		baseTosend := make(map[peer.ID]struct{}, len(tosend))
+		for p := range tosend {
+			baseTosend[p] = struct{}{}
+		}
 
-			// TODO: hook SPREAD propagation implementation here.
-			// Mock propagation mechanism that sends to all SPREAD peers in the topic (not real SPREAD!).
-			spreadPeers := gs.extensions.spreadState.GetSpreadPeers(topic)
-			for _, p := range spreadPeers {
-				// Don't send back to the originator
+		// If this message was marked as SPREAD and SPREAD mode is enabled on this router,
+		// override the default selection. If SPREAD selects fewer than the configured threshold,
+		// fill with peers from the default gossipsub set.
+		if gs.gossipProtocolChoice == SPREAD && msg.Spread {
+			clusterPeers, interClusterPeers := gs.extensions.spreadState.GetPropagationPeers(topic, gs.p.host.ID())
+			if gs.spreadPropagation == nil {
+				gs.spreadPropagation = NewSpreadPropagation(nil)
+			}
+			selected := gs.spreadPropagation.GetPeersForPropagation(from, clusterPeers, interClusterPeers)
+
+			spreadTosend := make(map[peer.ID]struct{}, len(selected))
+			for _, p := range selected {
 				if p == from || p == peer.ID(msg.GetFrom()) {
 					continue
 				}
-				tosend[p] = struct{}{}
+				spreadTosend[p] = struct{}{}
 			}
 
-			// TODO: Fallback mechanism
-			// Decide what to do if we don't have enough SPREAD peers.
-			// Decide on threshold (global and maybe per cluster).
+			minPeers := gs.spreadPropagation.config.FallbackThreshold
+			if len(spreadTosend) < minPeers {
+				for p := range baseTosend {
+					if len(spreadTosend) >= minPeers {
+						break
+					}
+					if p == from || p == peer.ID(msg.GetFrom()) {
+						continue
+					}
+					spreadTosend[p] = struct{}{}
+				}
+			}
+			if len(spreadTosend) > 0 {
+				tosend = spreadTosend
+			}
 		}
 
 		out := rpcWithMessages(msg.Message)

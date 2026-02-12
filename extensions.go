@@ -248,6 +248,21 @@ func WithVivaldi(vsvc *vivaldi.Service, cfg *VivaldiConfig) Option {
 	}
 }
 
+// WithSpreadClusteringConfig configures spread clustering behaviour.
+func WithSpreadClusteringConfig(cfg *SpreadClusteringConfig) Option {
+	return func(ps *PubSub) error {
+		gs, ok := ps.rt.(*GossipSubRouter)
+		if !ok {
+			return errors.New("pubsub router is not gossipsub")
+		}
+		if gs.extensions == nil || gs.extensions.spreadState == nil {
+			return errors.New("spread extension state not initialized")
+		}
+		gs.extensions.spreadState.ConfigureClustering(cfg)
+		return nil
+	}
+}
+
 type partialMessageRouter struct {
 	gs *GossipSubRouter
 }

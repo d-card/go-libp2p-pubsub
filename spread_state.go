@@ -2,6 +2,7 @@ package pubsub
 
 import (
 	"context"
+	"math"
 	"math/rand"
 	"sort"
 	"sync"
@@ -19,9 +20,15 @@ type SpreadState struct {
 	topics map[string]map[peer.ID]struct{}
 
 	// Vivaldi integration
-	vsvc       *vivaldi.Service
-	vconf      *VivaldiConfig
-	runnerStop func()
+	vivaldiService *vivaldi.Service
+	vivaldiConfig  *VivaldiConfig
+	runnerStop     func()
+
+	// SPREAD clustering configuration and lightweight cache.
+	clusteringConfig *SpreadClusteringConfig
+	sortedKnownByRTT []peer.ID
+	sortedKnownSet   map[peer.ID]struct{}
+	cacheDirty       bool
 }
 
 // VivaldiConfig holds configurable parameters for Vivaldi/Newton updates and runner.
@@ -40,13 +47,51 @@ type VivaldiConfig struct {
 	IN3MinSamples    int
 }
 
+// SpreadClusteringConfig controls how SPREAD candidates are partitioned.
+type SpreadClusteringConfig struct {
+	// ClusterPct is the percentage of topic peers selected as "local cluster".
+	// It is applied to find the closest ones over all spread peers in the topic (excluding self).
+	ClusterPct float64
+	// NumRings controls equal-sized ring partitioning of non-cluster known peers.
+	// Rings are unused now but can be explored in the future.
+	NumRings int
+}
+
+const (
+	DefaultSpreadClusterPct = 0.25
+	DefaultSpreadNumRings   = 3
+)
+
+func DefaultSpreadClusteringConfig() *SpreadClusteringConfig {
+	return &SpreadClusteringConfig{
+		ClusterPct: DefaultSpreadClusterPct,
+		NumRings:   DefaultSpreadNumRings,
+	}
+}
+
+func sanitizeSpreadClusteringConfig(cfg *SpreadClusteringConfig) *SpreadClusteringConfig {
+	out := DefaultSpreadClusteringConfig()
+	if cfg == nil {
+		return out
+	}
+	if cfg.ClusterPct > 0 && cfg.ClusterPct <= 1 {
+		out.ClusterPct = cfg.ClusterPct
+	}
+	if cfg.NumRings > 0 {
+		out.NumRings = cfg.NumRings
+	}
+	return out
+}
+
 func NewSpreadState() *SpreadState {
 	return &SpreadState{
-		peers:      make(map[peer.ID]struct{}),
-		topics:     make(map[string]map[peer.ID]struct{}),
-		vsvc:       nil,
-		vconf:      nil,
-		runnerStop: nil,
+		peers:            make(map[peer.ID]struct{}),
+		topics:           make(map[string]map[peer.ID]struct{}),
+		vivaldiService:   nil,
+		vivaldiConfig:    nil,
+		runnerStop:       nil,
+		clusteringConfig: DefaultSpreadClusteringConfig(),
+		cacheDirty:       true,
 	}
 }
 
@@ -54,6 +99,7 @@ func (s *SpreadState) AddPeer(p peer.ID) {
 	s.lk.Lock()
 	defer s.lk.Unlock()
 	s.peers[p] = struct{}{}
+	s.cacheDirty = true
 }
 
 func (s *SpreadState) RemovePeer(p peer.ID) {
@@ -67,6 +113,7 @@ func (s *SpreadState) RemovePeer(p peer.ID) {
 			delete(s.topics, t)
 		}
 	}
+	s.cacheDirty = true
 }
 
 func (s *SpreadState) AddPeerTopic(topic string, p peer.ID) {
@@ -82,6 +129,7 @@ func (s *SpreadState) AddPeerTopic(topic string, p peer.ID) {
 		s.topics[topic] = ps
 	}
 	ps[p] = struct{}{}
+	s.cacheDirty = true
 }
 
 func (s *SpreadState) RemovePeerTopic(topic string, p peer.ID) {
@@ -93,6 +141,7 @@ func (s *SpreadState) RemovePeerTopic(topic string, p peer.ID) {
 			delete(s.topics, topic)
 		}
 	}
+	s.cacheDirty = true
 }
 
 // GetSpreadPeers returns a slice of spread-capable peers for the given topic.
@@ -119,15 +168,23 @@ func (s *SpreadState) ConfigureVivaldi(vsvc *vivaldi.Service, cfg *VivaldiConfig
 		s.runnerStop()
 		s.runnerStop = nil
 	}
-	s.vsvc = vsvc
-	s.vconf = sanitizeVivaldiConfig(cfg)
+	s.vivaldiService = vsvc
+	s.vivaldiConfig = sanitizeVivaldiConfig(cfg)
+	s.cacheDirty = true
+}
+
+func (s *SpreadState) ConfigureClustering(cfg *SpreadClusteringConfig) {
+	s.lk.Lock()
+	defer s.lk.Unlock()
+	s.clusteringConfig = sanitizeSpreadClusteringConfig(cfg)
+	s.cacheDirty = true
 }
 
 // UpdatePeerVivaldi performs an ExchangeAndUpdate for a single peer.
 func (s *SpreadState) UpdatePeerVivaldi(ctx context.Context, p peer.ID) (*vivaldi.VivaldiState, error) {
 	s.lk.RLock()
-	vsvc := s.vsvc
-	vconf := s.vconf
+	vsvc := s.vivaldiService
+	vconf := s.vivaldiConfig
 	s.lk.RUnlock()
 	if vsvc == nil || vconf == nil {
 		return nil, nil
@@ -145,7 +202,13 @@ func (s *SpreadState) UpdatePeerVivaldi(ctx context.Context, p peer.ID) (*vivald
 		IN3MADKClose:           vconf.IN3MADKClose,
 		IN3MinSamples:          vconf.IN3MinSamples,
 	}
-	return vsvc.ExchangeAndUpdate(ctx, p, cfg)
+	st, err := vsvc.ExchangeAndUpdate(ctx, p, cfg)
+	if err == nil {
+		s.lk.Lock()
+		s.cacheDirty = true
+		s.lk.Unlock()
+	}
+	return st, err
 }
 
 // StartVivaldiRunner starts periodic exchanges to all known spread peers.
@@ -153,7 +216,7 @@ func (s *SpreadState) UpdatePeerVivaldi(ctx context.Context, p peer.ID) (*vivald
 func (s *SpreadState) StartVivaldiRunner() {
 	s.lk.Lock()
 	defer s.lk.Unlock()
-	if s.vsvc == nil || s.vconf == nil {
+	if s.vivaldiService == nil || s.vivaldiConfig == nil {
 		return
 	}
 	if s.runnerStop != nil {
@@ -162,7 +225,7 @@ func (s *SpreadState) StartVivaldiRunner() {
 	// Start a dynamic runner here in SpreadState so peer list changes are respected.
 	stopCh := make(chan struct{})
 	go func() {
-		interval := s.vconf.Interval
+		interval := s.vivaldiConfig.Interval
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
@@ -176,33 +239,36 @@ func (s *SpreadState) StartVivaldiRunner() {
 				for p := range s.peers {
 					curPeers = append(curPeers, p)
 				}
-				vsvc := s.vsvc
-				interval = s.vconf.Interval
+				vsvc := s.vivaldiService
+				interval = s.vivaldiConfig.Interval
 				ucfg := vivaldi.UpdateConfig{
-					Cc:                     s.vconf.Cc,
-					Ce:                     s.vconf.Ce,
-					Newton:                 s.vconf.Newton,
-					OutlierThreshold:       s.vconf.OutlierThreshold,
-					Samples:                s.vconf.Samples,
+					Cc:                     s.vivaldiConfig.Cc,
+					Ce:                     s.vivaldiConfig.Ce,
+					Newton:                 s.vivaldiConfig.Newton,
+					OutlierThreshold:       s.vivaldiConfig.OutlierThreshold,
+					Samples:                s.vivaldiConfig.Samples,
 					Interval:               interval,
-					IN1CentroidThresholdMS: s.vconf.IN1ThresholdMS,
-					IN2ProjectionThreshold: s.vconf.IN2ThresholdMS,
-					IN3MADKRandom:          s.vconf.IN3MADKRandom,
-					IN3MADKClose:           s.vconf.IN3MADKClose,
-					IN3MinSamples:          s.vconf.IN3MinSamples,
+					IN1CentroidThresholdMS: s.vivaldiConfig.IN1ThresholdMS,
+					IN2ProjectionThreshold: s.vivaldiConfig.IN2ThresholdMS,
+					IN3MADKRandom:          s.vivaldiConfig.IN3MADKRandom,
+					IN3MADKClose:           s.vivaldiConfig.IN3MADKClose,
+					IN3MinSamples:          s.vivaldiConfig.IN3MinSamples,
 				}
 				s.lk.RUnlock()
 				if vsvc == nil {
 					continue
 				}
 
-				selected, closePeers, randomPeers := selectNewtonNeighbors(curPeers, vsvc, s.vconf.NeighborSetSize)
+				selected, closePeers, randomPeers := selectNewtonNeighbors(curPeers, vsvc, s.vivaldiConfig.NeighborSetSize)
 				vsvc.SetNeighborSets(closePeers, randomPeers)
 				for _, p := range selected {
 					ctx, cancel := context.WithTimeout(context.Background(), interval)
 					_, _ = vsvc.ExchangeAndUpdate(ctx, p, ucfg)
 					cancel()
 				}
+				s.lk.Lock()
+				s.cacheDirty = true
+				s.lk.Unlock()
 			}
 		}
 	}()
@@ -227,10 +293,218 @@ func (s *SpreadState) ShutdownVivaldi() {
 		s.runnerStop()
 		s.runnerStop = nil
 	}
-	if s.vsvc != nil {
-		s.vsvc.Close()
-		s.vsvc = nil
+	if s.vivaldiService != nil {
+		s.vivaldiService.Close()
+		s.vivaldiService = nil
 	}
+	s.cacheDirty = true
+}
+
+// GetPropagationPeers returns cluster peers and inter-cluster peers for topic.
+func (s *SpreadState) GetPropagationPeers(topic string, self peer.ID) ([]peer.ID, []peer.ID) {
+
+	// Refresh sorted distance cache before getting propagation peers.
+	s.refreshDistanceCache(self)
+
+	// Get topic peers
+	s.lk.RLock()
+	topicPeers, ok := s.topics[topic]
+	if !ok || len(topicPeers) == 0 {
+		s.lk.RUnlock()
+		return nil, nil
+	}
+	cfg := s.clusteringConfig
+	sortedKnown := append([]peer.ID(nil), s.sortedKnownByRTT...)
+	knownSet := make(map[peer.ID]struct{}, len(s.sortedKnownSet))
+	for p := range s.sortedKnownSet {
+		knownSet[p] = struct{}{}
+	}
+	topicSet := make(map[peer.ID]struct{}, len(topicPeers))
+	for p := range topicPeers {
+		topicSet[p] = struct{}{}
+	}
+	s.lk.RUnlock()
+
+	// Compute topic size
+	totalTopicPeers := 0
+	for p := range topicSet {
+		if p != self {
+			totalTopicPeers++
+		}
+	}
+	if totalTopicPeers == 0 {
+		return nil, nil
+	}
+
+	// Compute cluster size
+	clusterSize := int(math.Ceil(float64(totalTopicPeers) * cfg.ClusterPct))
+	if clusterSize < 1 {
+		clusterSize = 1
+	}
+
+	// Identify known peers in the topic
+	knownInTopic := make([]peer.ID, 0, len(topicSet))
+	for _, p := range sortedKnown {
+		if p == self {
+			continue
+		}
+		if _, ok := topicSet[p]; ok {
+			knownInTopic = append(knownInTopic, p)
+		}
+	}
+
+	// Get cluster peers
+	if clusterSize > len(knownInTopic) {
+		clusterSize = len(knownInTopic)
+	}
+	clusterPeers := append([]peer.ID(nil), knownInTopic[:clusterSize]...)
+
+	clusterSet := make(map[peer.ID]struct{}, len(clusterPeers))
+	for _, p := range clusterPeers {
+		clusterSet[p] = struct{}{}
+	}
+
+	// Get inter-cluster peers: first the known ones in equal-sized rings, then the unknown ones.
+	knownRemainder := append([]peer.ID(nil), knownInTopic[clusterSize:]...)
+
+	unknownInTopic := make([]peer.ID, 0, len(topicSet))
+	for p := range topicSet {
+		if p == self {
+			continue
+		}
+		if _, inCluster := clusterSet[p]; inCluster {
+			continue
+		}
+		if _, known := knownSet[p]; known {
+			continue
+		}
+		unknownInTopic = append(unknownInTopic, p)
+	}
+	interPeers := append(knownRemainder, unknownInTopic...)
+	return clusterPeers, interPeers
+}
+
+// splitPeersForTesting is a helper to split peers into rings. Unused for now.
+func splitIntoEqualRings(peers []peer.ID, numRings int) [][]peer.ID {
+	if len(peers) == 0 {
+		return nil
+	}
+	if numRings <= 0 {
+		numRings = 1
+	}
+	if numRings > len(peers) {
+		numRings = len(peers)
+	}
+
+	rings := make([][]peer.ID, 0, numRings)
+	base := len(peers) / numRings
+	rem := len(peers) % numRings
+	start := 0
+	for i := 0; i < numRings; i++ {
+		size := base
+		if i < rem {
+			size++
+		}
+		end := start + size
+		rings = append(rings, append([]peer.ID(nil), peers[start:end]...))
+		start = end
+	}
+	return rings
+}
+
+// flattenRings is a helper to flatten rings into a single slice. Unused for now.
+func flattenRings(rings [][]peer.ID) []peer.ID {
+	if len(rings) == 0 {
+		return nil
+	}
+	total := 0
+	for _, ring := range rings {
+		total += len(ring)
+	}
+	out := make([]peer.ID, 0, total)
+	for _, ring := range rings {
+		out = append(out, ring...)
+	}
+	return out
+}
+
+func (s *SpreadState) refreshDistanceCache(self peer.ID) {
+	s.lk.RLock()
+
+	// If cache is clean, no need to refresh.
+	needsRefresh := s.cacheDirty
+	if !needsRefresh {
+		s.lk.RUnlock()
+		return
+	}
+	// Get vivaldi service and peers
+	vsvc := s.vivaldiService
+	peers := make([]peer.ID, 0, len(s.peers))
+	for p := range s.peers {
+		peers = append(peers, p)
+	}
+	s.lk.RUnlock()
+
+	// If no vivaldi service or no peers, reset cache to empty.
+	if vsvc == nil {
+		s.lk.Lock()
+		s.sortedKnownByRTT = nil
+		s.sortedKnownSet = nil
+		s.cacheDirty = false
+		s.lk.Unlock()
+		return
+	}
+
+	// If no local coordinate, we can't compute distances, so reset cache to unsorted.
+	local := vsvc.GetLocalState()
+	if local == nil {
+		s.lk.Lock()
+		s.sortedKnownByRTT = nil
+		s.sortedKnownSet = nil
+		s.cacheDirty = false
+		s.lk.Unlock()
+		return
+	}
+
+	// Compute distances to known peers and sort by distance.
+	type distanceEntry struct {
+		id   peer.ID
+		dist float64
+	}
+	known := make([]distanceEntry, 0, len(peers))
+	for _, p := range peers {
+		if p == self {
+			continue
+		}
+		// If peer has no coordinate, we can't compute distance, so treat as unknown
+		st := vsvc.GetPeerState(p)
+		if st == nil {
+			continue
+		}
+		known = append(known, distanceEntry{
+			id:   p,
+			dist: vivaldi.Distance(local.Coord, st.Coord),
+		})
+	}
+	// Sort by distance
+	sort.Slice(known, func(i, j int) bool {
+		return known[i].dist < known[j].dist
+	})
+
+	// Extract sorted peer IDs and sets for quick lookup.
+	sorted := make([]peer.ID, 0, len(known))
+	knownSet := make(map[peer.ID]struct{}, len(known))
+	for _, entry := range known {
+		sorted = append(sorted, entry.id)
+		knownSet[entry.id] = struct{}{}
+	}
+
+	// Update cache
+	s.lk.Lock()
+	s.sortedKnownByRTT = sorted
+	s.sortedKnownSet = knownSet
+	s.cacheDirty = false
+	s.lk.Unlock()
 }
 
 func sanitizeVivaldiConfig(cfg *VivaldiConfig) *VivaldiConfig {

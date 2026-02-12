@@ -15,24 +15,60 @@ type SpreadConfig struct {
 	IntraRho float64
 	// Inter-cluster communication probability: probability of selecting inter-cluster peers
 	InterProb float64
+	// Minimum number of peers to forward to when using SPREAD.
+	// If SPREAD selects fewer than this number, peers from gossipsub are added to fill up.
+	FallbackThreshold int
 }
 
 // Default configuration values
 const (
-	INTRA_FANOUT = 3
-	INTER_FANOUT = 8
-	INTRA_RHO    = 0.6
-	INTER_PROB   = 0.8
+	DefaultSpreadIntraFanout = 3
+	DefaultSpreadInterFanout = 8
+	DefaultSpreadIntraRho    = 0.6
+	DefaultSpreadInterProb   = 0.8
+	DefaultSpreadFallbackMin = 3
 )
 
-// TODO: wire it to actually be used in propagation.
 type SpreadPropagation struct {
 	config *SpreadConfig
 }
 
+func DefaultSpreadConfig() *SpreadConfig {
+	return &SpreadConfig{
+		IntraFanout:       DefaultSpreadIntraFanout,
+		InterFanout:       DefaultSpreadInterFanout,
+		IntraRho:          DefaultSpreadIntraRho,
+		InterProb:         DefaultSpreadInterProb,
+		FallbackThreshold: DefaultSpreadFallbackMin,
+	}
+}
+
+func sanitizeSpreadConfig(cfg *SpreadConfig) *SpreadConfig {
+	out := DefaultSpreadConfig()
+	if cfg == nil {
+		return out
+	}
+	if cfg.IntraFanout > 0 {
+		out.IntraFanout = cfg.IntraFanout
+	}
+	if cfg.InterFanout > 0 {
+		out.InterFanout = cfg.InterFanout
+	}
+	if cfg.IntraRho >= 0 && cfg.IntraRho <= 1 {
+		out.IntraRho = cfg.IntraRho
+	}
+	if cfg.InterProb >= 0 && cfg.InterProb <= 1 {
+		out.InterProb = cfg.InterProb
+	}
+	if cfg.FallbackThreshold > 0 {
+		out.FallbackThreshold = cfg.FallbackThreshold
+	}
+	return out
+}
+
 func NewSpreadPropagation(config *SpreadConfig) *SpreadPropagation {
 	return &SpreadPropagation{
-		config: config,
+		config: sanitizeSpreadConfig(config),
 	}
 }
 
@@ -43,7 +79,9 @@ func (sp *SpreadPropagation) GetPeersForPropagation(from peer.ID, clusterPeers [
 	// Intra-cluster
 
 	// Add mandatory cluster peer
-	selectedPeers[SelectRandomPeerID(clusterPeers)] = struct{}{}
+	if mandatory := SelectRandomPeerID(clusterPeers); mandatory != "" {
+		selectedPeers[mandatory] = struct{}{}
+	}
 	// Coin flip to decide whether to select more intra-cluster peers
 	if rand.Float64() < sp.config.IntraRho {
 		// Select [intra fanout - 1] more random ones

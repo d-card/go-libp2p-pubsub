@@ -171,6 +171,10 @@ func hvDiff(a, b Coord) Coord {
 	return Coord{X: a.X - b.X, Y: a.Y - b.Y, H: a.H - b.H}
 }
 
+func Distance(a, b Coord) float64 {
+	return euclideanDist(a, b) + a.H + b.H
+}
+
 func median(vals []float64) float64 {
 	if len(vals) == 0 {
 		return 0
