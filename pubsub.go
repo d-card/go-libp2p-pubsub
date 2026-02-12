@@ -844,6 +844,9 @@ func WithAppSpecificRpcInspector(inspector func(peer.ID, *RPC) error) Option {
 // processLoop handles all inputs arriving on the channels
 func (p *PubSub) processLoop(ctx context.Context) {
 	defer func() {
+		if gs, ok := p.rt.(*GossipSubRouter); ok && gs.extensions != nil && gs.extensions.spreadState != nil {
+			gs.extensions.spreadState.ShutdownVivaldi()
+		}
 		// Clean up go routines.
 		for _, queue := range p.peers {
 			queue.Close()

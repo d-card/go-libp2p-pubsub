@@ -6,6 +6,7 @@ import (
 
 	"github.com/libp2p/go-libp2p-pubsub/partialmessages"
 	pubsub_pb "github.com/libp2p/go-libp2p-pubsub/pb"
+	"github.com/libp2p/go-libp2p-pubsub/vivaldi"
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 
@@ -223,6 +224,26 @@ func WithPartialMessagesExtension(pm *partialmessages.PartialMessagesExtension) 
 
 		gs.extensions.myExtensions.PartialMessages = true
 		gs.extensions.partialMessagesExtension = pm
+		return nil
+	}
+}
+
+// WithVivaldi wires a Vivaldi service into the spread extension and starts
+// the runner. Passing a nil service disables Vivaldi.
+func WithVivaldi(vsvc *vivaldi.Service, cfg *VivaldiConfig) Option {
+	return func(ps *PubSub) error {
+		gs, ok := ps.rt.(*GossipSubRouter)
+		if !ok {
+			return errors.New("pubsub router is not gossipsub")
+		}
+		if gs.extensions == nil || gs.extensions.spreadState == nil {
+			return errors.New("spread extension state not initialized")
+		}
+		gs.extensions.spreadState.ConfigureVivaldi(vsvc, cfg)
+		// Start runner if service is provided
+		if vsvc != nil {
+			gs.extensions.spreadState.StartVivaldiRunner()
+		}
 		return nil
 	}
 }

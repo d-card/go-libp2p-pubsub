@@ -1,7 +1,8 @@
-// Package vivaldi implements the Vivaldi and Newton-Vivaldi coordinate update logic for virtual coordinate systems.
+// Package vivaldi implements the Vivaldi/Newton update logic for virtual coordinates.
 package vivaldi
 
 import (
+	"fmt"
 	"math"
 )
 
@@ -23,58 +24,96 @@ type VivaldiUpdateParams struct {
 	Local            VivaldiState // Our node's state
 	Remote           VivaldiState // State from other peer
 	RTT              float64      // Measured RTT (ms)
-	Ce               float64      // Local learning rate (e.g. 0.25)
+	Ce               float64      // Error correction constant
+	Cc               float64      // Coordinate correction constant
 	Newton           bool         // If true, apply Newton-Vivaldi security checks
-	TrustScore       float64      // Optional: trust score for remote (0-1, only used if Newton=true). TODO: check Newton paper for good values.
-	OutlierThreshold float64      // Optional: threshold for outlier rejection (only used if Newton=true). TODO: check Newton paper for good values.
+	OutlierThreshold float64      // Optional outlier threshold on force magnitude (ms)
 }
 
-// UpdateVivaldi performs a Vivaldi/Newton-Vivaldi coordinate update step.
-// Returns the new local coordinate and error.
-func UpdateVivaldi(params VivaldiUpdateParams) (Coord, float64) {
-	// Predicted distance
-	predDist := euclideanDist(params.Local.Coord, params.Remote.Coord) + params.Local.Coord.H + params.Remote.Coord.H
-	// Error
-	delta := params.RTT - predDist
-	// Combine errors
+type UpdateResult struct {
+	NewCoord       Coord
+	NewError       float64
+	Weight         float64
+	SampleRelError float64
+	ForceVector    Coord
+	ForceMagnitude float64
+	PredictedRTTMS float64
+}
+
+// UpdateVivaldi performs the Vivaldi Algorithm 1 update with height-vector operations.
+func UpdateVivaldi(params VivaldiUpdateParams) (UpdateResult, error) {
+	if params.RTT <= 0 {
+		return UpdateResult{}, fmt.Errorf("vivaldi: non-positive RTT %.4fms", params.RTT)
+	}
+	if params.Ce <= 0 || params.Cc <= 0 {
+		return UpdateResult{}, fmt.Errorf("vivaldi: invalid constants ce=%.4f cc=%.4f", params.Ce, params.Cc)
+	}
+
+	// Height-vector distance prediction: ||[xi - xj, hi + hj]||
+	diff := hvSub(params.Local.Coord, params.Remote.Coord)
+	predDist := hvNorm(diff)
+	forceMag := params.RTT - predDist
+
+	// Newton outlier guard if requested.
+	if params.Newton && params.OutlierThreshold > 0 && math.Abs(forceMag) > params.OutlierThreshold {
+		return UpdateResult{}, fmt.Errorf(
+			"newton: outlier detected (|force|=%.4f > threshold=%.4f)",
+			math.Abs(forceMag), params.OutlierThreshold,
+		)
+	}
+
+	// Algorithm 1: w = ei / (ei + ej)
 	totalErr := params.Local.Error + params.Remote.Error
-	if totalErr == 0 {
-		totalErr = 1e-6 // avoid div by zero
+	if totalErr <= 0 {
+		totalErr = 1e-6
 	}
-	// Weight for remote
 	w := params.Local.Error / totalErr
-	if w < 0.01 {
-		w = 0.01
+	if w < 0 {
+		w = 0
 	}
-	if w > 0.99 {
-		w = 0.99
-	}
-
-	// Newton checks
-	if params.Newton {
-		if params.OutlierThreshold > 0 && math.Abs(delta) > params.OutlierThreshold {
-			// Outlier: ignore update
-			return params.Local.Coord, params.Local.Error
-		}
-		if params.TrustScore > 0 && params.TrustScore < 1 {
-			w = w * params.TrustScore
-		}
+	if w > 1 {
+		w = 1
 	}
 
-	// Update coordinate
-	adj := params.Ce * w
-	newCoord := Coord{
-		X: params.Local.Coord.X + adj*(params.Remote.Coord.X-params.Local.Coord.X+delta*unit(params.Local.Coord, params.Remote.Coord).X),
-		Y: params.Local.Coord.Y + adj*(params.Remote.Coord.Y-params.Local.Coord.Y+delta*unit(params.Local.Coord, params.Remote.Coord).Y),
-		H: params.Local.Coord.H + adj*(params.Remote.Coord.H-params.Local.Coord.H+delta*0.5), // height update simplified
+	// e_s = |pred-rtt| / rtt
+	es := math.Abs(predDist-params.RTT) / params.RTT
+
+	// alpha = ce * w
+	alpha := params.Ce * w
+	if alpha < 0 {
+		alpha = 0
+	}
+	if alpha > 1 {
+		alpha = 1
 	}
 
-	// Update error
-	newErr := params.Local.Error + params.Ce*(math.Abs(delta)-params.Local.Error)
+	// e_i = alpha*e_s + (1-alpha)*e_i
+	newErr := alpha*es + (1-alpha)*params.Local.Error
 	if newErr < 1e-6 {
 		newErr = 1e-6
 	}
-	return newCoord, newErr
+
+	// delta = cc * w
+	delta := params.Cc * w
+
+	// x_i = x_i + delta * (rtt - ||xi-xj||) * u(xi-xj)
+	u := hvUnit(diff)
+	forceVec := hvScale(u, forceMag)
+	step := hvScale(u, delta*forceMag)
+	newCoord := hvAdd(params.Local.Coord, step)
+	if newCoord.H < 0 {
+		newCoord.H = 0
+	}
+
+	return UpdateResult{
+		NewCoord:       newCoord,
+		NewError:       newErr,
+		Weight:         w,
+		SampleRelError: es,
+		ForceVector:    forceVec,
+		ForceMagnitude: math.Abs(forceMag),
+		PredictedRTTMS: predDist,
+	}, nil
 }
 
 func euclideanDist(a, b Coord) float64 {
@@ -83,13 +122,86 @@ func euclideanDist(a, b Coord) float64 {
 	return math.Sqrt(dx*dx + dy*dy)
 }
 
-// unit returns the unit vector from a to b in 2D.
-func unit(a, b Coord) Coord {
-	dx := b.X - a.X
-	dy := b.Y - a.Y
-	d := math.Sqrt(dx*dx + dy*dy)
-	if d == 0 {
-		return Coord{0, 0, 0}
+func hvSub(a, b Coord) Coord {
+	return Coord{
+		X: a.X - b.X,
+		Y: a.Y - b.Y,
+		H: a.H + b.H,
 	}
-	return Coord{dx / d, dy / d, 0}
+}
+
+func hvAdd(a, b Coord) Coord {
+	return Coord{
+		X: a.X + b.X,
+		Y: a.Y + b.Y,
+		H: a.H + b.H,
+	}
+}
+
+func hvScale(a Coord, s float64) Coord {
+	return Coord{
+		X: a.X * s,
+		Y: a.Y * s,
+		H: a.H * s,
+	}
+}
+
+func hvNorm(a Coord) float64 {
+	return math.Sqrt(a.X*a.X+a.Y*a.Y) + a.H
+}
+
+func hvUnit(a Coord) Coord {
+	n := hvNorm(a)
+	if n == 0 {
+		// As in Vivaldi, break ties randomly if colocated.
+		return Coord{X: 1, Y: 0, H: 0}
+	}
+	return hvScale(a, 1.0/n)
+}
+
+func hvDot(a, b Coord) float64 {
+	return a.X*b.X + a.Y*b.Y + a.H*b.H
+}
+
+func hvProjection(a, unitDir Coord) Coord {
+	return hvScale(unitDir, hvDot(a, unitDir))
+}
+
+func hvDiff(a, b Coord) Coord {
+	return Coord{X: a.X - b.X, Y: a.Y - b.Y, H: a.H - b.H}
+}
+
+func median(vals []float64) float64 {
+	if len(vals) == 0 {
+		return 0
+	}
+	tmp := append([]float64(nil), vals...)
+	sortFloat64s(tmp)
+	n := len(tmp)
+	if n%2 == 1 {
+		return tmp[n/2]
+	}
+	return (tmp[n/2-1] + tmp[n/2]) / 2
+}
+
+func mad(vals []float64, med float64) float64 {
+	if len(vals) == 0 {
+		return 0
+	}
+	dev := make([]float64, len(vals))
+	for i, v := range vals {
+		dev[i] = math.Abs(v - med)
+	}
+	return median(dev)
+}
+
+func sortFloat64s(v []float64) {
+	for i := 1; i < len(v); i++ {
+		x := v[i]
+		j := i - 1
+		for ; j >= 0 && v[j] > x; j-- {
+			v[j+1] = v[j]
+		}
+		v[j+1] = x
+	}
 }
