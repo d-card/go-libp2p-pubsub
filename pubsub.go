@@ -263,6 +263,7 @@ type Message struct {
 	ReceivedFrom  peer.ID
 	ValidatorData interface{}
 	Local         bool
+	Spread        bool
 }
 
 func (m *Message) GetFrom() peer.ID {
@@ -843,6 +844,9 @@ func WithAppSpecificRpcInspector(inspector func(peer.ID, *RPC) error) Option {
 // processLoop handles all inputs arriving on the channels
 func (p *PubSub) processLoop(ctx context.Context) {
 	defer func() {
+		if gs, ok := p.rt.(*GossipSubRouter); ok && gs.extensions != nil && gs.extensions.spreadState != nil {
+			gs.extensions.spreadState.ShutdownVivaldi()
+		}
 		// Clean up go routines.
 		for _, queue := range p.peers {
 			queue.Close()
@@ -1418,7 +1422,11 @@ func (p *PubSub) handleIncomingRPC(rpc *RPC) {
 				continue
 			}
 
-			msg := &Message{Message: pmsg, ID: "", ReceivedFrom: rpc.from, ValidatorData: nil, Local: false}
+			msg := &Message{Message: pmsg, ID: "", ReceivedFrom: rpc.from, ValidatorData: nil, Local: false, Spread: false}
+			// If the enclosing RPC marks the publish as SPREAD, forward that marker to the internal message
+			if rpc.GetSpread() != nil {
+				msg.Spread = rpc.GetSpread().GetSourceIsSpreadNode()
+			}
 			if p.shouldPush(msg) {
 				toPush = append(toPush, msg)
 			}
