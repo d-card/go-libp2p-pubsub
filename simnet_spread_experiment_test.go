@@ -13,6 +13,7 @@ import (
 	"os"
 	"sort"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -26,8 +27,8 @@ import (
 const experimentTopic = "spread-vs-gossipsub-simnet"
 
 const (
-	SPREAD_SIMNET_NODES                     = 5                // Number of nodes
-	SPREAD_SIMNET_TRIALS                    = 1                // Number of messages published
+	SPREAD_SIMNET_NODES                     = 20               // Number of nodes
+	SPREAD_SIMNET_TRIALS                    = 2                // Number of messages published
 	SPREAD_SIMNET_WINDOW_SIZE               = 1                // Number of trials to aggregate in the same window (for understanding temporal evolution of metrics due to vivaldi warmup)
 	SPREAD_SIMNET_WARMUP_EVERY              = 1                // Number of trials between warm-up rounds of vivaldi
 	SPREAD_SIMNET_WARMUP_ROUNDS_PER_PUBLISH = 1                // Number of vivaldi rounds to warm up before each publish
@@ -134,6 +135,18 @@ func runScenario(t *testing.T, topo experimentTopology, cfg scenarioConfig) expe
 			opts = append(opts,
 				WithProtocolChoice(SPREAD),
 				withSpreadExtensionAdvertise(),
+				WithSpreadClusteringConfig(&SpreadClusteringConfig{
+					ClusterPct: 0.25,
+					NumRings:   4, // Not used
+				}),
+				WithSpreadPropagationConfig(&SpreadConfig{
+					IntraFanout:            DefaultSpreadIntraFanout,
+					InterFanout:            DefaultSpreadInterFanout,
+					IntraRho:               DefaultSpreadIntraRho,
+					InterProb:              DefaultSpreadInterProb,
+					FallbackThreshold:      DefaultSpreadFallbackMin,
+					DuplicateRepropagation: 5,
+				}),
 				WithVivaldi(vsvc, &VivaldiConfig{
 					Cc:               0.25,
 					Ce:               0.25,
@@ -174,7 +187,7 @@ func runScenario(t *testing.T, topo experimentTopology, cfg scenarioConfig) expe
 
 	t.Logf("%s: completed setup in %s, starting trials", cfg.name, time.Since(startTimeNetBuild))
 
-	time.Sleep(10 * time.Second)
+	time.Sleep(2 * time.Second)
 
 	res := experimentResult{
 		latencyMS:       make([]float64, 0, cfg.trials*(len(psubs)-1)),
@@ -301,8 +314,8 @@ func warmUpSpreadVivaldiRound(t *testing.T, ctx context.Context, psubs []*PubSub
 	}
 
 	tasks := make([]task, 0, len(psubs))
+	tasksOut := make(chan task, len(psubs))
 	for _, ps := range psubs {
-		done := make(chan task, 1)
 		psLocal := ps
 		psLocal.eval <- func() {
 			gs := psLocal.rt.(*GossipSubRouter)
@@ -311,18 +324,27 @@ func warmUpSpreadVivaldiRound(t *testing.T, ctx context.Context, psubs []*PubSub
 			for p := range ss.peers {
 				peers = append(peers, p)
 			}
-			done <- task{state: ss, peers: peers}
+			tasksOut <- task{state: ss, peers: peers}
 		}
-		tasks = append(tasks, <-done)
+	}
+	for i := 0; i < len(psubs); i++ {
+		tasks = append(tasks, <-tasksOut)
 	}
 
+	// Parallelize warmup across nodes; keep each node's peer updates ordered.
+	var wg sync.WaitGroup
 	for _, tk := range tasks {
-		for _, pid := range tk.peers {
-			exCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
-			_, _ = tk.state.UpdatePeerVivaldi(exCtx, pid)
-			cancel()
-		}
+		wg.Add(1)
+		go func(tk task) {
+			defer wg.Done()
+			for _, pid := range tk.peers {
+				exCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+				_, _ = tk.state.UpdatePeerVivaldi(exCtx, pid)
+				cancel()
+			}
+		}(tk)
 	}
+	wg.Wait()
 }
 
 func makeEthereumLikeTopology(t *testing.T, n int, seed int64) experimentTopology {
