@@ -1486,6 +1486,9 @@ func (p *PubSub) shouldPush(msg *Message) bool {
 	id := p.idGen.ID(msg)
 	if p.seenMessage(id) {
 		p.tracer.DuplicateMessage(msg)
+		if gs, ok := p.rt.(*GossipSubRouter); ok && gs.canRelaySeenSpreadDuplicate(msg) && gs.hasSpreadDuplicateRelayBudget(msg.GetTopic(), id) {
+			return true
+		}
 		return false
 	}
 
@@ -1496,6 +1499,13 @@ func (p *PubSub) shouldPush(msg *Message) bool {
 func (p *PubSub) pushMsg(msg *Message) {
 	src := msg.ReceivedFrom
 	id := p.idGen.ID(msg)
+
+	if p.seenMessage(id) {
+		if gs, ok := p.rt.(*GossipSubRouter); ok && gs.canRelaySeenSpreadDuplicate(msg) && gs.consumeSpreadDuplicateRelayBudget(msg.GetTopic(), id) {
+			gs.Publish(msg)
+		}
+		return
+	}
 
 	if !p.val.Push(src, msg) {
 		return

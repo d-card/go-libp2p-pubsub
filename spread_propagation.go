@@ -18,15 +18,19 @@ type SpreadConfig struct {
 	// Minimum number of peers to forward to when using SPREAD.
 	// If SPREAD selects fewer than this number, peers from gossipsub are added to fill up.
 	FallbackThreshold int
+	// Number of times a seen SPREAD message may be re-propagated as a duplicate.
+	// This is the number of extra forwards after the first forward.
+	DuplicateRepropagation int
 }
 
 // Default configuration values
 const (
-	DefaultSpreadIntraFanout = 3
-	DefaultSpreadInterFanout = 8
-	DefaultSpreadIntraRho    = 0.6
-	DefaultSpreadInterProb   = 0.8
-	DefaultSpreadFallbackMin = 3
+	DefaultSpreadIntraFanout            = 3
+	DefaultSpreadInterFanout            = 8
+	DefaultSpreadIntraRho               = 0.6
+	DefaultSpreadInterProb              = 0.8
+	DefaultSpreadFallbackMin            = 3
+	DefaultSpreadDuplicateRepropagation = 0
 )
 
 type SpreadPropagation struct {
@@ -35,11 +39,12 @@ type SpreadPropagation struct {
 
 func DefaultSpreadConfig() *SpreadConfig {
 	return &SpreadConfig{
-		IntraFanout:       DefaultSpreadIntraFanout,
-		InterFanout:       DefaultSpreadInterFanout,
-		IntraRho:          DefaultSpreadIntraRho,
-		InterProb:         DefaultSpreadInterProb,
-		FallbackThreshold: DefaultSpreadFallbackMin,
+		IntraFanout:            DefaultSpreadIntraFanout,
+		InterFanout:            DefaultSpreadInterFanout,
+		IntraRho:               DefaultSpreadIntraRho,
+		InterProb:              DefaultSpreadInterProb,
+		FallbackThreshold:      DefaultSpreadFallbackMin,
+		DuplicateRepropagation: DefaultSpreadDuplicateRepropagation,
 	}
 }
 
@@ -62,6 +67,9 @@ func sanitizeSpreadConfig(cfg *SpreadConfig) *SpreadConfig {
 	}
 	if cfg.FallbackThreshold > 0 {
 		out.FallbackThreshold = cfg.FallbackThreshold
+	}
+	if cfg.DuplicateRepropagation >= 0 {
+		out.DuplicateRepropagation = cfg.DuplicateRepropagation
 	}
 	return out
 }

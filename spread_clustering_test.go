@@ -84,3 +84,17 @@ func TestSanitizeSpreadConfigFallbackThreshold(t *testing.T) {
 		t.Fatalf("expected default fallback threshold %d, got %d", DefaultSpreadFallbackMin, cfg.FallbackThreshold)
 	}
 }
+
+func TestSanitizeSpreadConfigDuplicateRepropagation(t *testing.T) {
+	cfg := sanitizeSpreadConfig(&SpreadConfig{
+		DuplicateRepropagation: 3,
+	})
+	if cfg.DuplicateRepropagation != 3 {
+		t.Fatalf("expected duplicate repropagation 3, got %d", cfg.DuplicateRepropagation)
+	}
+
+	cfg = sanitizeSpreadConfig(nil)
+	if cfg.DuplicateRepropagation != DefaultSpreadDuplicateRepropagation {
+		t.Fatalf("expected default duplicate repropagation %d, got %d", DefaultSpreadDuplicateRepropagation, cfg.DuplicateRepropagation)
+	}
+}
