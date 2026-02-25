@@ -13,7 +13,6 @@ import (
 	"time"
 
 	pb "github.com/libp2p/go-libp2p-pubsub/pb"
-	"google.golang.org/appengine/log"
 
 	"github.com/libp2p/go-libp2p/core/event"
 	"github.com/libp2p/go-libp2p/core/host"
@@ -293,46 +292,30 @@ func NewGossipSubWithRouter(ctx context.Context, h host.Host, rt PubSubRouter, o
 // DefaultGossipSubRouter returns a new GossipSubRouter with default parameters.
 func DefaultGossipSubRouter(h host.Host) *GossipSubRouter {
 	params := DefaultGossipSubParams()
-	var hierarchicalGossip *HierarchicalGossip = nil
-	var dandelionGossip *DandelionGossip = nil
-
-	hierarchicalDataProvider := NewHierarchicalDataProvider(h.ID())
-	hierarchicalGossip = NewHierarchicalGossip(&HierarchicalGossipConfig{
-		IntraFanout: INTRA_FANOUT,
-		InterFanout: INTER_FANOUT,
-		IntraRho:    INTRA_RHO,
-		InterProb:   INTER_PROB,
-	}, hierarchicalDataProvider)
-
-	dandelionGossip = NewDandelionGossip(&DandelionGossipConfig{
-		FANOUT: FANOUT,
-		PROB:   PROB,
-	})
 
 	rt := &GossipSubRouter{
-		peers:           make(map[peer.ID]protocol.ID),
-		mesh:            make(map[string]map[peer.ID]struct{}),
-		fanout:          make(map[string]map[peer.ID]struct{}),
-		lastpub:         make(map[string]int64),
-		gossip:          make(map[peer.ID][]*pb.ControlIHave),
-		control:         make(map[peer.ID]*pb.ControlMessage),
-		backoff:         make(map[string]map[peer.ID]time.Time),
-		peerhave:        make(map[peer.ID]int),
-		peerdontwant:    make(map[peer.ID]int),
-		unwanted:        make(map[peer.ID]map[checksum]int),
-		iasked:          make(map[peer.ID]int),
-		outbound:        make(map[peer.ID]bool),
-		connect:         make(chan connectInfo, params.MaxPendingConnections),
-		cab:             pstoremem.NewAddrBook(),
-		mcache:          NewMessageCache(params.HistoryGossip, params.HistoryLength),
-		protos:          GossipSubDefaultProtocols,
-		feature:         GossipSubDefaultFeatures,
-		tagTracer:       newTagTracer(h.ConnManager()),
-		params:          params,
-		reducePXRecords: defaultPXRecordReducer,
-		// SPREAD params
-		hierarchicalGossip: hierarchicalGossip,
-		dandelionGossip:    dandelionGossip,
+		peers:                       make(map[peer.ID]protocol.ID),
+		mesh:                        make(map[string]map[peer.ID]struct{}),
+		fanout:                      make(map[string]map[peer.ID]struct{}),
+		lastpub:                     make(map[string]int64),
+		gossip:                      make(map[peer.ID][]*pb.ControlIHave),
+		control:                     make(map[peer.ID]*pb.ControlMessage),
+		backoff:                     make(map[string]map[peer.ID]time.Time),
+		peerhave:                    make(map[peer.ID]int),
+		peerdontwant:                make(map[peer.ID]int),
+		unwanted:                    make(map[peer.ID]map[checksum]int),
+		iasked:                      make(map[peer.ID]int),
+		outbound:                    make(map[peer.ID]bool),
+		connect:                     make(chan connectInfo, params.MaxPendingConnections),
+		cab:                         pstoremem.NewAddrBook(),
+		mcache:                      NewMessageCache(params.HistoryGossip, params.HistoryLength),
+		protos:                      GossipSubDefaultProtocols,
+		feature:                     GossipSubDefaultFeatures,
+		tagTracer:                   newTagTracer(h.ConnManager()),
+		params:                      params,
+		reducePXRecords:             defaultPXRecordReducer,
+		spreadPropagation:           NewSpreadPropagation(nil),
+		spreadRelayDuplicateCounter: make(map[spreadDuplicateKey]int),
 	}
 
 	rt.extensions = newExtensionsState(PeerExtensions{}, func(p peer.ID) {
@@ -392,6 +375,18 @@ func WithProtocolChoice(choice GossipProtocolChoice) Option {
 			return fmt.Errorf("cannot set protocol choice since pubsub router is not gossipsub")
 		}
 		gs.gossipProtocolChoice = choice
+		return nil
+	}
+}
+
+// WithSpreadPropagationConfig configures SPREAD peer selection fanout/probability.
+func WithSpreadPropagationConfig(cfg *SpreadConfig) Option {
+	return func(ps *PubSub) error {
+		gs, ok := ps.rt.(*GossipSubRouter)
+		if !ok {
+			return fmt.Errorf("pubsub router is not gossipsub")
+		}
+		gs.spreadPropagation = NewSpreadPropagation(cfg)
 		return nil
 	}
 }
@@ -684,14 +679,13 @@ type GossipSubRouter struct {
 	// clean up -- eg backoff clean up.
 	heartbeatTicks uint64
 
-	// Hierarchical gossip
-	hierarchicalGossip *HierarchicalGossip
-
-	// Dandelion gossip
-	dandelionGossip *DandelionGossip
-
 	// GossipProtocolChoice
 	gossipProtocolChoice GossipProtocolChoice
+
+	// SPREAD propagation selector.
+	spreadPropagation *SpreadPropagation
+	// Per-(topic, message ID) duplicate SPREAD re-propagation counters.
+	spreadRelayDuplicateCounter map[spreadDuplicateKey]int
 }
 
 var _ BatchPublisher = &GossipSubRouter{}
@@ -699,6 +693,11 @@ var _ BatchPublisher = &GossipSubRouter{}
 type connectInfo struct {
 	p   peer.ID
 	spr *record.Envelope
+}
+
+type spreadDuplicateKey struct {
+	topic string
+	msgID string
 }
 
 func (gs *GossipSubRouter) Protocols() []protocol.ID {
@@ -1354,12 +1353,54 @@ func (gs *GossipSubRouter) Publish(msg *Message) {
 	}
 }
 
-/*
-	TODO:
+func (gs *GossipSubRouter) canRelaySeenSpreadDuplicate(msg *Message) bool {
+	if msg == nil || !msg.Spread {
+		return false
+	}
+	if gs.spreadPropagation == nil || gs.extensions == nil || !gs.extensions.myExtensions.Spread {
+		return false
+	}
+	return gs.spreadPropagation.config.DuplicateRepropagation > 0
+}
 
-- Look for SPREAD extension in message.
-  - If present, use SPREAD propagation. Else, use normal GossipSub propagation.
-*/
+func (gs *GossipSubRouter) hasSpreadDuplicateRelayBudget(topic, msgID string) bool {
+	maxRelays := gs.spreadPropagation.config.DuplicateRepropagation
+	if maxRelays <= 0 {
+		return false
+	}
+
+	key := spreadDuplicateKey{topic: topic, msgID: msgID}
+	return gs.spreadRelayDuplicateCounter[key] < maxRelays
+}
+
+func (gs *GossipSubRouter) consumeSpreadDuplicateRelayBudget(topic, msgID string) bool {
+	maxRelays := gs.spreadPropagation.config.DuplicateRepropagation
+	if maxRelays <= 0 {
+		return false
+	}
+
+	key := spreadDuplicateKey{topic: topic, msgID: msgID}
+	used := gs.spreadRelayDuplicateCounter[key]
+	if used >= maxRelays {
+		return false
+	}
+
+	gs.spreadRelayDuplicateCounter[key] = used + 1
+	return true
+}
+
+func (gs *GossipSubRouter) cleanupSpreadDuplicateRelayBudget() {
+	if len(gs.spreadRelayDuplicateCounter) == 0 {
+		return
+	}
+	for key := range gs.spreadRelayDuplicateCounter {
+		if gs.p.seenMessage(key.msgID) {
+			continue
+		}
+		delete(gs.spreadRelayDuplicateCounter, key)
+	}
+}
+
 func (gs *GossipSubRouter) rpcs(msg *Message) iter.Seq2[peer.ID, *RPC] {
 	return func(yield func(peer.ID, *RPC) bool) {
 		gs.mcache.Put(msg)
@@ -1429,36 +1470,53 @@ func (gs *GossipSubRouter) rpcs(msg *Message) iter.Seq2[peer.ID, *RPC] {
 			}
 		}
 
-		if gs.gossipProtocolChoice == HIERARCHICAL_GOSSIP {
-			tosend = make(map[peer.ID]struct{})
-			forwardingPeers := gs.hierarchicalGossip.GetForwardingPeers(from)
-			for _, peer := range forwardingPeers {
-				tosend[peer] = struct{}{}
-			}
+		baseTosend := make(map[peer.ID]struct{}, len(tosend))
+		for p := range tosend {
+			baseTosend[p] = struct{}{}
 		}
 
-		if gs.gossipProtocolChoice == DANDELION_GOSSIP {
-			tosend = make(map[peer.ID]struct{})
-			// msg.Message.Data is of form: [MSG_NUMBER] from [SOURCE_NODE_ID] DandelionCoin [DANDELION_COIN]
-			// Read the DandelionCoin from the message
-			msgDandelionCoin, err := gs.dandelionGossip.ReadDandelionCoin(msg.Message.Data)
-			if err != nil {
-				log.Errorf("Failed to read DandelionCoin from message: %v", err)
-				return
+		// If this message was marked as SPREAD and SPREAD mode is enabled on this router,
+		// override the default selection. If SPREAD selects fewer than the configured threshold,
+		// fill with peers from the default gossipsub set.
+		if gs.gossipProtocolChoice == SPREAD && msg.Spread {
+			clusterPeers, interClusterPeers := gs.extensions.spreadState.GetPropagationPeers(topic, gs.p.host.ID())
+			if gs.spreadPropagation == nil {
+				gs.spreadPropagation = NewSpreadPropagation(nil)
 			}
-			forwardingPeers, newDandelionCoin := gs.dandelionGossip.GetForwardingPeers(from, gs.p.topics[topic], msgDandelionCoin)
-			for _, peer := range forwardingPeers {
-				tosend[peer] = struct{}{}
+			selected := gs.spreadPropagation.GetPeersForPropagation(from, clusterPeers, interClusterPeers)
+
+			spreadTosend := make(map[peer.ID]struct{}, len(selected))
+			for _, p := range selected {
+				if p == from || p == peer.ID(msg.GetFrom()) {
+					continue
+				}
+				spreadTosend[p] = struct{}{}
 			}
 
-			msg.Message.Data, err = gs.dandelionGossip.ReplaceDandelionCoin(msg.Message.Data, newDandelionCoin)
-			if err != nil {
-				log.Errorf("Failed to replace DandelionCoin in message: %v", err)
-				return
+			minPeers := gs.spreadPropagation.config.FallbackThreshold
+			if len(spreadTosend) < minPeers {
+				for p := range baseTosend {
+					if len(spreadTosend) >= minPeers {
+						break
+					}
+					if p == from || p == peer.ID(msg.GetFrom()) {
+						continue
+					}
+					spreadTosend[p] = struct{}{}
+				}
+			}
+			if len(spreadTosend) > 0 {
+				tosend = spreadTosend
 			}
 		}
 
 		out := rpcWithMessages(msg.Message)
+		// Set RPC-level spread extension if both the router is configured to use
+		// SPREAD by default and the message explicitly requests spread.
+		if gs.gossipProtocolChoice == SPREAD && msg.Spread {
+			v := true
+			out.Spread = &pb.SpreadExtension{SourceIsSpreadNode: &v}
+		}
 		for pid := range tosend {
 			if pid == from || pid == peer.ID(msg.GetFrom()) {
 				continue
@@ -1945,6 +2003,7 @@ func (gs *GossipSubRouter) heartbeat() {
 
 	// advance the message history window
 	gs.mcache.Shift()
+	gs.cleanupSpreadDuplicateRelayBudget()
 
 	gs.extensions.Heartbeat()
 }

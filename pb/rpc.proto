@@ -30,7 +30,8 @@ message RPC {
   // bytes
   optional TestExtension testExtension = 6492434;
 
-  // TODO: add spread extension here
+  // SPREAD extension: advertises that a peer supports SPREAD propagation
+  optional SpreadExtension spread = 6492435;
 
 }
 
@@ -85,6 +86,8 @@ message ControlExtensions {
   // Experimental extensions must use field numbers larger than 0x200000 to be
   // encoded with 4 bytes
   optional bool testExtension = 6492434;
+
+  optional bool spread = 6492435;
 }
 
 message PeerInfo {
@@ -105,7 +108,5 @@ message PartialMessagesExtension {
   optional bytes partsMetadata = 4;
 }
 
-// TODO: check if we need to define any extra data. Maybe Vivaldi?
-message SpreadExtension {
-  optional bool sourceIsSpreadNode = 1;
-}
+// TODO: check if we need to define any extra data. Maybe "source is spread node" or Vivaldi data?
+message SpreadExtension {}
