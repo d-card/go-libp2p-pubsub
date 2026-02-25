@@ -3,10 +3,12 @@ package pubsub
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"net"
 	"testing"
 	"time"
 
+	"github.com/libp2p/go-libp2p-pubsub/vivaldi"
 	simlibp2p "github.com/libp2p/go-libp2p/x/simlibp2p"
 	simnet "github.com/marcopolo/simnet"
 )
@@ -19,17 +21,29 @@ const (
 	SPREAD_SIMNET_TWO_NODES_TIMEOUT = 90 * time.Second       // Overall timeout for the test
 )
 
-// Tests a network with 2 nodes and a direct link between them, with a configured latency.
-// The test verifies that a message published on one node is received on the other node within the expected latency bounds.
+type twoNodeScenarioResult struct {
+	observed time.Duration
+	stretch  float64
+}
+
+// Tests two-node direct latency first with Gossipsub, then with Spread, using
+// comparable configuration knobs from the larger spread experiment.
 func TestSimnetTwoNodesDirectLatency(t *testing.T) {
+	gs := runTwoNodeScenario(t, false)
+	t.Logf("[gossipsub] configured=%s observed=%s stretch=%.3f",
+		SPREAD_SIMNET_TWO_NODES_LATENCY, gs.observed, gs.stretch)
 
-	// Sample topic
-	const topicName = "spread-simnet-two-nodes"
-	// Sample payload
-	payload := []byte("two-nodes")
+	sp := runTwoNodeScenario(t, true)
+	t.Logf("[spread] configured=%s observed=%s stretch=%.3f",
+		SPREAD_SIMNET_TWO_NODES_LATENCY, sp.observed, sp.stretch)
+}
 
-	latency := SPREAD_SIMNET_TWO_NODES_LATENCY
-
+func runTwoNodeScenario(t *testing.T, useSpread bool) twoNodeScenarioResult {
+	t.Helper()
+	label := "gossipsub"
+	if useSpread {
+		label = "spread"
+	}
 	netCreationStart := time.Now()
 
 	// Map IP addresses to node idx
@@ -57,7 +71,7 @@ func TestSimnetTwoNodesDirectLatency(t *testing.T) {
 		if !aok || !bok || a == b {
 			return 0
 		}
-		return latency
+		return SPREAD_SIMNET_TWO_NODES_LATENCY
 	}, simlibp2p.NetworkSettings{UseBlankHost: true})
 	if err != nil {
 		t.Fatalf("build two-nodes simnet network: %v", err)
@@ -75,11 +89,61 @@ func TestSimnetTwoNodesDirectLatency(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), SPREAD_SIMNET_TWO_NODES_TIMEOUT)
 	defer cancel()
 
-	// Build gossipsub instances on each node and join the topic
-	ps0 := getGossipsub(ctx, meta.Nodes[0])
-	ps1 := getGossipsub(ctx, meta.Nodes[1])
+	baseOpts := []Option{
+		WithGossipSubParams(func() GossipSubParams {
+			p := DefaultGossipSubParams()
+			p.HeartbeatInitialDelay = 300 * time.Millisecond
+			p.HeartbeatInterval = 1000 * time.Millisecond
+			return p
+		}()),
+	}
+	opts0 := append([]Option{}, baseOpts...)
+	opts1 := append([]Option{}, baseOpts...)
+	if useSpread {
+		v0 := vivaldi.NewService(meta.Nodes[0], &vivaldi.Config{Timeout: 500 * time.Millisecond})
+		v1 := vivaldi.NewService(meta.Nodes[1], &vivaldi.Config{Timeout: 500 * time.Millisecond})
+		opts0 = append(opts0,
+			WithProtocolChoice(SPREAD),
+			withSpreadExtensionAdvertise(),
+			WithVivaldi(v0, &VivaldiConfig{
+				Cc:               0.25,
+				Ce:               0.25,
+				Newton:           true,
+				OutlierThreshold: 0,
+				Samples:          1,
+				Interval:         150 * time.Millisecond,
+				NeighborSetSize:  24,
+				IN1ThresholdMS:   20,
+				IN2ThresholdMS:   35,
+				IN3MADKRandom:    5,
+				IN3MADKClose:     8,
+				IN3MinSamples:    4,
+			}),
+		)
+		opts1 = append(opts1,
+			WithProtocolChoice(SPREAD),
+			withSpreadExtensionAdvertise(),
+			WithVivaldi(v1, &VivaldiConfig{
+				Cc:               0.25,
+				Ce:               0.25,
+				Newton:           true,
+				OutlierThreshold: 0,
+				Samples:          1,
+				Interval:         150 * time.Millisecond,
+				NeighborSetSize:  24,
+				IN1ThresholdMS:   20,
+				IN2ThresholdMS:   35,
+				IN3MADKRandom:    5,
+				IN3MADKClose:     8,
+				IN3MinSamples:    4,
+			}),
+		)
+	}
 
-	// Join the topic on each node
+	ps0 := getGossipsub(ctx, meta.Nodes[0], opts0...)
+	ps1 := getGossipsub(ctx, meta.Nodes[1], opts1...)
+
+	topicName := fmt.Sprintf("spread-simnet-two-nodes-%s", label)
 	topic0, err := ps0.Join(topicName)
 	if err != nil {
 		t.Fatalf("join topic on node0: %v", err)
@@ -102,17 +166,22 @@ func TestSimnetTwoNodesDirectLatency(t *testing.T) {
 	connectAll(t, meta.Nodes)
 
 	netCreationTime := time.Since(netCreationStart)
-	t.Logf("Network creation time: %s", netCreationTime)
+	t.Logf("[%s] network creation time: %s", label, netCreationTime)
 
 	time.Sleep(2 * time.Second)
 
-	// Publish a message on node0 and measure the time until it's received on node1
+	payload := []byte(fmt.Sprintf("two-nodes-%s", label))
 	start := time.Now()
-	if err := topic0.Publish(ctx, payload); err != nil {
-		t.Fatalf("publish from node0: %v", err)
+	if useSpread {
+		if err := publishWithSpread(ctx, topic0, payload); err != nil {
+			t.Fatalf("publish spread from node0: %v", err)
+		}
+	} else {
+		if err := topic0.Publish(ctx, payload); err != nil {
+			t.Fatalf("publish gossipsub from node0: %v", err)
+		}
 	}
 
-	// Wait for the message to be received on node1
 	var observed time.Duration
 	for {
 		msg, err := sub1.Next(ctx)
@@ -126,6 +195,6 @@ func TestSimnetTwoNodesDirectLatency(t *testing.T) {
 		break
 	}
 
-	stretch := float64(observed) / float64(latency)
-	t.Logf("Latency: configured=%s observed=%s stretch=%.3f", latency, observed, stretch)
+	stretch := float64(observed) / float64(SPREAD_SIMNET_TWO_NODES_LATENCY)
+	return twoNodeScenarioResult{observed: observed, stretch: stretch}
 }
