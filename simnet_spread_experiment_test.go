@@ -1,13 +1,5 @@
 // Simnet experiment
-// Command: RUN_SPREAD_SIMNET_EXPERIMENT=1 go test -tags simnet -run TestSimnetSpreadVsGossipsubLatencyStretch -v .
-// Useful env vars:
-// - RUN_SPREAD_SIMNET_EXPERIMENT=1
-// - SPREAD_SIMNET_NODES (default 30)
-// - SPREAD_SIMNET_TRIALS (default 60)
-// - SPREAD_SIMNET_WINDOW_SIZE (default 10)
-// - SPREAD_SIMNET_WARMUP_EVERY (default 1)
-// - SPREAD_SIMNET_WARMUP_ROUNDS_PER_PUBLISH (default 1)
-// - SPREAD_SIMNET_SEED (default 1337)
+// Command: go test -tags simnet -run TestSimnetSpreadVsGossipsubLatencyStretch -v .
 
 package pubsub
 
@@ -27,38 +19,37 @@ import (
 	"github.com/libp2p/go-libp2p-pubsub/vivaldi"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
+	simlibp2p "github.com/libp2p/go-libp2p/x/simlibp2p"
 	simnet "github.com/marcopolo/simnet"
 )
 
 const experimentTopic = "spread-vs-gossipsub-simnet"
 
 const (
-	SPREAD_SIMNET_NODES                     = 30
-	SPREAD_SIMNET_TRIALS                    = 60
-	SPREAD_SIMNET_WINDOW_SIZE               = 10
-	SPREAD_SIMNET_WARMUP_EVERY              = 1
-	SPREAD_SIMNET_WARMUP_ROUNDS_PER_PUBLISH = 1
-	SPREAD_SIMNET_SEED                      = 1337
+	SPREAD_SIMNET_NODES                     = 5                // Number of nodes
+	SPREAD_SIMNET_TRIALS                    = 1                // Number of messages published
+	SPREAD_SIMNET_WINDOW_SIZE               = 1                // Number of trials to aggregate in the same window (for understanding temporal evolution of metrics due to vivaldi warmup)
+	SPREAD_SIMNET_WARMUP_EVERY              = 1                // Number of trials between warm-up rounds of vivaldi
+	SPREAD_SIMNET_WARMUP_ROUNDS_PER_PUBLISH = 1                // Number of vivaldi rounds to warm up before each publish
+	SPREAD_SIMNET_SEED                      = 1337             // Random seed for topology generation (latencies and node regions)
+	SPREAD_SIMNET_LINK_MIBPS                = 20               // Link bandwidth in MiB/s for all links in the simnet topology
+	SPREAD_SIMNET_SCENARIO_TIMEOUT          = 10 * time.Minute // Overall timeout for each scenario
 )
 
 type experimentResult struct {
-	latencyMS       []float64
-	stretch         []float64
-	windowLatencyMS map[int][]float64
-	windowStretch   map[int][]float64
+	latencyMS       []float64         // latency in milliseconds for each received message
+	stretch         []float64         // stretch for each received message
+	windowLatencyMS map[int][]float64 // latency in milliseconds for each received message, grouped by window
+	windowStretch   map[int][]float64 // stretch for each received message, grouped by window
 }
 
 type experimentTopology struct {
-	hosts   []host.Host
-	edges   map[int][]int     // adjacency list
-	weights [][]time.Duration // symmetric matrix of edge weights (latencies)
+	hosts   []host.Host       // all hosts in the test
+	weights [][]time.Duration // symmetric matrix of direct pair latencies
 	closeFn func()
 }
 
 func TestSimnetSpreadVsGossipsubLatencyStretch(t *testing.T) {
-	if os.Getenv("RUN_SPREAD_SIMNET_EXPERIMENT") != "1" {
-		t.Skip("set RUN_SPREAD_SIMNET_EXPERIMENT=1 to run this experiment")
-	}
 
 	// Test parameters
 	nodeCount := envInt("SPREAD_SIMNET_NODES", SPREAD_SIMNET_NODES)
@@ -66,6 +57,8 @@ func TestSimnetSpreadVsGossipsubLatencyStretch(t *testing.T) {
 	windowSize := envInt("SPREAD_SIMNET_WINDOW_SIZE", SPREAD_SIMNET_WINDOW_SIZE)
 	seed := int64(envInt("SPREAD_SIMNET_SEED", SPREAD_SIMNET_SEED))
 
+	// Run gossipsub
+	gossipsubStartTime := time.Now()
 	gsTopo := makeEthereumLikeTopology(t, nodeCount, seed)
 	defer gsTopo.closeFn()
 	gsRes := runScenario(t, gsTopo, scenarioConfig{
@@ -76,7 +69,10 @@ func TestSimnetSpreadVsGossipsubLatencyStretch(t *testing.T) {
 		warmupEvery:      0,
 		warmupPerPublish: 0,
 	})
+	t.Logf("gossipsub: full scenario completed in %s", time.Since(gossipsubStartTime))
 
+	// Run spread
+	spreadStartTime := time.Now()
 	spreadTopo := makeEthereumLikeTopology(t, nodeCount, seed)
 	defer spreadTopo.closeFn()
 	spreadRes := runScenario(t, spreadTopo, scenarioConfig{
@@ -87,7 +83,9 @@ func TestSimnetSpreadVsGossipsubLatencyStretch(t *testing.T) {
 		warmupEvery:      envInt("SPREAD_SIMNET_WARMUP_EVERY", SPREAD_SIMNET_WARMUP_EVERY),
 		warmupPerPublish: envInt("SPREAD_SIMNET_WARMUP_ROUNDS_PER_PUBLISH", SPREAD_SIMNET_WARMUP_ROUNDS_PER_PUBLISH),
 	})
+	t.Logf("spread: full scenario completed in %s", time.Since(spreadStartTime))
 
+	// Print results
 	t.Logf("overall gossipsub: latency p50=%.2fms p95=%.2fms; stretch p50=%.3f p95=%.3f",
 		percentile(gsRes.latencyMS, 0.50), percentile(gsRes.latencyMS, 0.95),
 		percentile(gsRes.stretch, 0.50), percentile(gsRes.stretch, 0.95))
@@ -110,9 +108,13 @@ type scenarioConfig struct {
 
 func runScenario(t *testing.T, topo experimentTopology, cfg scenarioConfig) experimentResult {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	// Set timer for scenario
+	ctx, cancel := context.WithTimeout(context.Background(), SPREAD_SIMNET_SCENARIO_TIMEOUT)
 	defer cancel()
 
+	startTimeNetBuild := time.Now()
+
+	// Base gossipsub options
 	baseOpts := []Option{
 		WithGossipSubParams(func() GossipSubParams {
 			p := DefaultGossipSubParams()
@@ -122,9 +124,11 @@ func runScenario(t *testing.T, topo experimentTopology, cfg scenarioConfig) expe
 		}()),
 	}
 
+	// Build pubsubs
 	psubs := make([]*PubSub, 0, len(topo.hosts))
 	for _, h := range topo.hosts {
 		opts := append([]Option{}, baseOpts...)
+		// Add spread options if set
 		if cfg.useSpread {
 			vsvc := vivaldi.NewService(h, &vivaldi.Config{Timeout: 500 * time.Millisecond})
 			opts = append(opts,
@@ -133,7 +137,7 @@ func runScenario(t *testing.T, topo experimentTopology, cfg scenarioConfig) expe
 				WithVivaldi(vsvc, &VivaldiConfig{
 					Cc:               0.25,
 					Ce:               0.25,
-					Newton:           true,
+					Newton:           false,
 					OutlierThreshold: 0,
 					Samples:          1,
 					Interval:         150 * time.Millisecond,
@@ -149,6 +153,7 @@ func runScenario(t *testing.T, topo experimentTopology, cfg scenarioConfig) expe
 		psubs = append(psubs, getGossipsub(ctx, h, opts...))
 	}
 
+	// Join topics and subscribe
 	topics := make([]*Topic, len(psubs))
 	subs := make([]*Subscription, len(psubs))
 	for i, ps := range psubs {
@@ -164,7 +169,12 @@ func runScenario(t *testing.T, topo experimentTopology, cfg scenarioConfig) expe
 		subs[i] = sub
 	}
 
-	time.Sleep(2 * time.Second)
+	// Connect all nodes
+	connectAll(t, topo.hosts)
+
+	t.Logf("%s: completed setup in %s, starting trials", cfg.name, time.Since(startTimeNetBuild))
+
+	time.Sleep(10 * time.Second)
 
 	res := experimentResult{
 		latencyMS:       make([]float64, 0, cfg.trials*(len(psubs)-1)),
@@ -173,24 +183,31 @@ func runScenario(t *testing.T, topo experimentTopology, cfg scenarioConfig) expe
 		windowStretch:   make(map[int][]float64),
 	}
 
+	// Run trials
 	for trial := 0; trial < cfg.trials; trial++ {
+		// Warm-up vivaldi if configured
 		if cfg.useSpread && cfg.warmupEvery > 0 && trial%cfg.warmupEvery == 0 {
 			for i := 0; i < cfg.warmupPerPublish; i++ {
 				warmUpSpreadVivaldiRound(t, ctx, psubs)
 			}
 		}
 
+		// Select source node for this trial
 		src := trial % len(psubs)
+		// Sample payload
 		payload := []byte(fmt.Sprintf("%s-msg-%d", cfg.name, trial))
+		// Channel to receive results from subscribers
 		out := make(chan recvResult, len(psubs)-1)
 
+		// Start waiting for messages on all subscribers in parallel, except the source
 		for i := range psubs {
 			if i == src {
 				continue
 			}
-			go waitForMessage(i, subs[i], payload, out)
+			go waitForMessage(ctx, i, subs[i], payload, out)
 		}
 
+		// Start the timer right before publish
 		start := time.Now()
 		if cfg.useSpread {
 			if err := publishWithSpread(ctx, topics[src], payload); err != nil {
@@ -202,22 +219,25 @@ func runScenario(t *testing.T, topo experimentTopology, cfg scenarioConfig) expe
 			}
 		}
 
-		shortest := shortestPathDurations(src, topo.edges, topo.weights)
+		// Compute current window for results aggregation
 		window := trial / max(1, cfg.windowSize)
 
+		// Wait for all subscribers to receive the message and collect results
 		for i := 0; i < len(psubs)-1; i++ {
 			rr := <-out
 			if rr.err != nil {
 				t.Fatalf("%s: receive trial=%d source=%d: %v", cfg.name, trial, src, rr.err)
 			}
 
+			// Calculate latency as: recvResult.at - publish start time
 			obs := rr.at.Sub(start)
 			obsMS := float64(obs) / float64(time.Millisecond)
 			res.latencyMS = append(res.latencyMS, obsMS)
 			res.windowLatencyMS[window] = append(res.windowLatencyMS[window], obsMS)
 
-			base := shortest[rr.idx]
-			if base <= 0 || base >= infDuration {
+			// Compute stretch as: observed latency / direct pair latency between source and receiver
+			base := topo.weights[src][rr.idx]
+			if base <= 0 {
 				continue
 			}
 			st := float64(obs) / float64(base)
@@ -230,15 +250,12 @@ func runScenario(t *testing.T, topo experimentTopology, cfg scenarioConfig) expe
 }
 
 type recvResult struct {
-	idx int
+	idx int // index of the receiving peer
 	at  time.Time
 	err error
 }
 
-func waitForMessage(idx int, sub *Subscription, payload []byte, out chan<- recvResult) {
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-
+func waitForMessage(ctx context.Context, idx int, sub *Subscription, payload []byte, out chan<- recvResult) {
 	for {
 		msg, err := sub.Next(ctx)
 		at := time.Now()
@@ -310,30 +327,72 @@ func warmUpSpreadVivaldiRound(t *testing.T, ctx context.Context, psubs []*PubSub
 
 func makeEthereumLikeTopology(t *testing.T, n int, seed int64) experimentTopology {
 	t.Helper()
-	if n < 6 {
-		t.Fatalf("node count must be >= 6, got %d", n)
+	if n < 2 {
+		t.Fatalf("node count must be >= 2, got %d", n)
 	}
 
-	weights, closeSimnet := makeEthereumLikeLatencyMatrix(t, n, seed)
+	startTime := time.Now()
 
-	hosts := getDefaultHosts(t, n)
-	edges := make(map[int][]int, n)
+	// Get latencies
+	weights := makeEthereumLikeLatencyMatrix(t, n, seed)
+
+	// Map IP addresses to node idx
+	idxByIP := make(map[string]int, n)
 	for i := 0; i < n; i++ {
-		for j := i + 1; j < n; j++ {
-			addUndirectedEdge(edges, i, j)
-		}
+		idxByIP[simnet.IntToPublicIPv4(i).String()] = i
 	}
-	connectAll(t, hosts)
+
+	// Create network with n nodes and with the configured latencies
+	linkMiBps := envInt("SPREAD_SIMNET_LINK_MIBPS", SPREAD_SIMNET_LINK_MIBPS)
+	network, meta, err := simlibp2p.SimpleLibp2pNetwork([]simlibp2p.NodeLinkSettingsAndCount{
+		{
+			LinkSettings: simnet.NodeBiDiLinkSettings{
+				Downlink: simnet.LinkSettings{BitsPerSecond: linkMiBps * simlibp2p.OneMbps, MTU: 1400},
+				Uplink:   simnet.LinkSettings{BitsPerSecond: linkMiBps * simlibp2p.OneMbps, MTU: 1400},
+			},
+			Count: n,
+		},
+	}, func(p *simnet.Packet) time.Duration {
+		from, fok := p.From.(*net.UDPAddr)
+		to, tok := p.To.(*net.UDPAddr)
+		if !fok || !tok {
+			return 0
+		}
+		a, aok := idxByIP[from.IP.String()]
+		b, bok := idxByIP[to.IP.String()]
+		if !aok || !bok || a == b {
+			return 0
+		}
+		return weights[a][b]
+	}, simlibp2p.NetworkSettings{UseBlankHost: true})
+	if err != nil {
+		t.Fatalf("build simlibp2p network: %v", err)
+	}
+
+	// Start network
+	network.Start()
+
+	// Extract hosts
+	hosts := make([]host.Host, 0, len(meta.Nodes))
+	for _, h := range meta.Nodes {
+		hosts = append(hosts, h)
+	}
+
+	t.Logf("created simnet topology with %d nodes in %s", n, time.Since(startTime))
 
 	return experimentTopology{
 		hosts:   hosts,
-		edges:   edges,
 		weights: weights,
-		closeFn: closeSimnet,
+		closeFn: func() {
+			network.Close()
+			for _, h := range meta.Nodes {
+				_ = h.Close()
+			}
+		},
 	}
 }
 
-func makeEthereumLikeLatencyMatrix(t *testing.T, n int, seed int64) ([][]time.Duration, func()) {
+func makeEthereumLikeLatencyMatrix(t *testing.T, n int, seed int64) [][]time.Duration {
 	t.Helper()
 	// Regions
 	type region int
@@ -386,6 +445,7 @@ func makeEthereumLikeLatencyMatrix(t *testing.T, n int, seed int64) ([][]time.Du
 		nodeRegion[i] = regionDist[rng.Intn(len(regionDist))]
 	}
 
+	// Get latency for all pairs with +/-10% jitter, ensuring a minimum of 1ms to avoid unrealistically low latencies.
 	weights := make([][]time.Duration, n)
 	for i := range weights {
 		weights[i] = make([]time.Duration, n)
@@ -394,97 +454,14 @@ func makeEthereumLikeLatencyMatrix(t *testing.T, n int, seed int64) ([][]time.Du
 		for j := i + 1; j < n; j++ {
 			m := base[nodeRegion[i]][nodeRegion[j]]
 			jitter := (rng.Float64()*0.20 - 0.10) * m // +/-10%
-			latMs := math.Max(2, m+jitter)
+			latMs := math.Max(1, m+jitter)
 			lat := time.Duration(latMs * float64(time.Millisecond))
 			weights[i][j] = lat
 			weights[j][i] = lat
 		}
 	}
 
-	// Build a real simnet object with the same matrix for aligned future extensions.
-	sn := &simnet.Simnet{}
-	settings := simnet.NodeBiDiLinkSettings{
-		Downlink: simnet.LinkSettings{BitsPerSecond: 1000 * simnet.Mibps, MTU: 1400},
-		Uplink:   simnet.LinkSettings{BitsPerSecond: 1000 * simnet.Mibps, MTU: 1400},
-	}
-	addrToIdx := make(map[string]int, n)
-	addrs := make([]*net.UDPAddr, n)
-	for i := 0; i < n; i++ {
-		addrs[i] = &net.UDPAddr{IP: net.ParseIP(fmt.Sprintf("10.0.0.%d", i+1)), Port: 10000 + i}
-		addrToIdx[addrs[i].String()] = i
-		sn.NewEndpoint(addrs[i], settings)
-	}
-	sn.LatencyFunc = func(p *simnet.Packet) time.Duration {
-		a, aok := addrToIdx[p.From.String()]
-		b, bok := addrToIdx[p.To.String()]
-		if !aok || !bok || a == b {
-			return 0
-		}
-		return weights[a][b]
-	}
-	sn.Start()
-
-	return weights, func() { sn.Close() }
-}
-
-func addUndirectedEdge(edges map[int][]int, a, b int) {
-	if a == b {
-		return
-	}
-	if !containsInt(edges[a], b) {
-		edges[a] = append(edges[a], b)
-	}
-	if !containsInt(edges[b], a) {
-		edges[b] = append(edges[b], a)
-	}
-}
-
-func containsInt(xs []int, x int) bool {
-	for _, v := range xs {
-		if v == x {
-			return true
-		}
-	}
-	return false
-}
-
-const infDuration = time.Duration(math.MaxInt64 / 4)
-
-// shortestPathDurations computes the shortest path durations from src to all other nodes using Dijkstra's algorithm.
-func shortestPathDurations(src int, edges map[int][]int, weights [][]time.Duration) []time.Duration {
-	n := len(weights)
-	dist := make([]time.Duration, n)
-	used := make([]bool, n)
-	for i := range dist {
-		dist[i] = infDuration
-	}
-	dist[src] = 0
-
-	for {
-		u := -1
-		best := infDuration
-		for i := 0; i < n; i++ {
-			if !used[i] && dist[i] < best {
-				best = dist[i]
-				u = i
-			}
-		}
-		if u == -1 {
-			break
-		}
-		used[u] = true
-		for _, v := range edges[u] {
-			w := weights[u][v]
-			if w <= 0 || dist[u] == infDuration {
-				continue
-			}
-			cand := dist[u] + w
-			if cand < dist[v] {
-				dist[v] = cand
-			}
-		}
-	}
-	return dist
+	return weights
 }
 
 func logWindowStats(t *testing.T, name string, res experimentResult, windowSize int) {
