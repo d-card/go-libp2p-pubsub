@@ -5,7 +5,9 @@ package pubsub
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
 	"math/rand"
@@ -28,9 +30,9 @@ const experimentTopic = "spread-vs-gossipsub-simnet"
 
 const (
 	SPREAD_SIMNET_NODES                     = 20               // Number of nodes
-	SPREAD_SIMNET_TRIALS                    = 2                // Number of messages published
-	SPREAD_SIMNET_WINDOW_SIZE               = 1                // Number of trials to aggregate in the same window (for understanding temporal evolution of metrics due to vivaldi warmup)
-	SPREAD_SIMNET_WARMUP_EVERY              = 1                // Number of trials between warm-up rounds of vivaldi
+	SPREAD_SIMNET_TRIALS                    = 500                // Number of messages published
+	SPREAD_SIMNET_WINDOW_SIZE               = 10                // Number of trials to aggregate in the same window (for understanding temporal evolution of metrics due to vivaldi warmup)
+	SPREAD_SIMNET_WARMUP_EVERY              = 0                // Number of trials between warm-up rounds of vivaldi
 	SPREAD_SIMNET_WARMUP_ROUNDS_PER_PUBLISH = 1                // Number of vivaldi rounds to warm up before each publish
 	SPREAD_SIMNET_SEED                      = 1337             // Random seed for topology generation (latencies and node regions)
 	SPREAD_SIMNET_LINK_MIBPS                = 20               // Link bandwidth in MiB/s for all links in the simnet topology
@@ -416,70 +418,97 @@ func makeEthereumLikeTopology(t *testing.T, n int, seed int64) experimentTopolog
 
 func makeEthereumLikeLatencyMatrix(t *testing.T, n int, seed int64) [][]time.Duration {
 	t.Helper()
-	// Regions
-	type region int
-	const (
-		usEast region = iota
-		usWest
-		europe
-		asia
-		southAmerica
-		oceania
-	)
-	// Approximate median one-way latencies (ms) between regions.
-	// We can use real-world latency data through the sources:
-	// - https://www.samnet.dev/tools/global-latency/index.html
-	// - https://www.cloudping.info/
-	// - https://cloudping.net/
-	// - https://wondernetwork.com/pings
-	// - https://www.cloudping.co/
-	// - https://www.economize.cloud/resources/aws/latency
-	// - https://dashboard.pipenetwork.com/network-latency
-	// We used cloudping with the filter:
-	// - usEast → us-east-1 (N. Virginia)
-	// - usWest → us-west-2 (Oregon)
-	// - Europe → eu-west-1 (Ireland)
-	// - Asia → ap-southeast-1 (Singapore)
-	// - SouthAmerica → sa-east-1 (São Paulo)
-	// - Oceania → ap-southeast-2 (Sydney)
-	// Table:
-	// from \ to | usEast | usWest | europe | asia | southAmerica | oceania
-	// usEast 	 | 1.36   | 64     | 67    | 215  | 113          | 199
-	// usWest 	 | 57	 | 8.5    | 118    | 168 | 174 | 140
-	// europe 	 | 67    | 123    | 1.57   | 175 | 176 | 255
-	// asia 	 | 216 | 177 | 177 | 1.06 | 325 | 94
-	// southAmerica | 114 | 178 | 176 | 325 | 1.58 | 311
-	// Oceania  | 200 | 148 | 255 | 94 | 311 | 1.05
-	base := map[region]map[region]float64{
-		usEast:       {usEast: 1.36, usWest: 64, europe: 67, asia: 215, southAmerica: 113, oceania: 199},
-		usWest:       {usEast: 57, usWest: 8.5, europe: 118, asia: 168, southAmerica: 174, oceania: 140},
-		europe:       {usEast: 67, usWest: 123, europe: 1.57, asia: 175, southAmerica: 176, oceania: 255},
-		asia:         {usEast: 216, usWest: 177, europe: 177, asia: 1.06, southAmerica: 325, oceania: 94},
-		southAmerica: {usEast: 114, usWest: 178, europe: 176, asia: 325, southAmerica: 1.58, oceania: 311},
-		oceania:      {usEast: 200, usWest: 148, europe: 255, asia: 94, southAmerica: 311, oceania: 1.05},
+
+	type nodeEntry struct {
+		ID        int     `json:"id"`
+		Latitude  float64 `json:"latitude"`
+		Longitude float64 `json:"longitude"`
+	}
+
+	type pingEntry struct {
+		Source      int     `json:"source"`
+		Destination int     `json:"destination"`
+		Min         float64 `json:"min"`
+		Avg         float64 `json:"avg"`
+		Max         float64 `json:"max"`
+		Mdev        float64 `json:"mdev"`
+	}
+
+	nodesFile, err := os.Open("spread_data/nodes.json")
+	if err != nil {
+		t.Fatalf("open spread_data/nodes.json: %v", err)
+	}
+	defer nodesFile.Close()
+
+	var allNodes []nodeEntry
+	if err := json.NewDecoder(nodesFile).Decode(&allNodes); err != nil {
+		t.Fatalf("decode spread_data/nodes.json: %v", err)
+	}
+	if len(allNodes) < n {
+		t.Fatalf("not enough nodes in spread_data/nodes.json: need %d, have %d", n, len(allNodes))
 	}
 
 	rng := rand.New(rand.NewSource(seed))
-	// Regions with duplication weighted to increase the likelihood of regions
-	regionDist := []region{usEast, usEast, usWest, usWest, europe, europe, asia, asia, southAmerica, oceania}
-	nodeRegion := make([]region, n)
-	for i := 0; i < n; i++ {
-		nodeRegion[i] = regionDist[rng.Intn(len(regionDist))]
+	indices := make([]int, len(allNodes))
+	for i := range indices {
+		indices[i] = i
+	}
+	rng.Shuffle(len(indices), func(i, j int) {
+		indices[i], indices[j] = indices[j], indices[i]
+	})
+	selected := indices[:n]
+
+	idToIdx := make(map[int]int, n)
+	for i, idx := range selected {
+		idToIdx[allNodes[idx].ID] = i
 	}
 
-	// Get latency for all pairs with +/-10% jitter, ensuring a minimum of 1ms to avoid unrealistically low latencies.
 	weights := make([][]time.Duration, n)
 	for i := range weights {
 		weights[i] = make([]time.Duration, n)
 	}
-	for i := 0; i < n; i++ {
-		for j := i + 1; j < n; j++ {
-			m := base[nodeRegion[i]][nodeRegion[j]]
-			jitter := (rng.Float64()*0.20 - 0.10) * m // +/-10%
-			latMs := math.Max(1, m+jitter)
-			lat := time.Duration(latMs * float64(time.Millisecond))
-			weights[i][j] = lat
-			weights[j][i] = lat
+
+	pingsFile, err := os.Open("spread_data/pings.json.gz")
+	if err != nil {
+		t.Fatalf("open spread_data/pings.json.gz: %v", err)
+	}
+	defer pingsFile.Close()
+
+	gzr, err := gzip.NewReader(pingsFile)
+	if err != nil {
+		t.Fatalf("create gzip reader for spread_data/pings.json.gz: %v", err)
+	}
+	defer gzr.Close()
+
+	dec := json.NewDecoder(gzr)
+	// Consume opening '[' of the JSON array in the gzip stream.
+	if _, err := dec.Token(); err != nil {
+		t.Fatalf("decode spread_data/pings.json.gz: %v", err)
+	}
+
+	for dec.More() {
+		var pe pingEntry
+		if err := dec.Decode(&pe); err != nil {
+			t.Fatalf("decode ping entry from spread_data/pings.json: %v", err)
+		}
+
+		a, okA := idToIdx[pe.Source]
+		b, okB := idToIdx[pe.Destination]
+		if !okA || !okB || a == b {
+			continue
+		}
+
+		// Use half of the average RTT (ms) as an approximation of one-way latency.
+		if pe.Avg <= 0 {
+			continue
+		}
+		oneWayMs := pe.Avg / 2.0
+		lat := time.Duration(math.Max(1, oneWayMs) * float64(time.Millisecond))
+
+		// If multiple samples exist for a pair, keep the minimum latency.
+		if weights[a][b] == 0 || lat < weights[a][b] {
+			weights[a][b] = lat
+			weights[b][a] = lat
 		}
 	}
 
