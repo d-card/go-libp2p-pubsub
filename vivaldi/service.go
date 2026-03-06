@@ -34,6 +34,8 @@ type Service struct {
 	peerMeta    map[peerpkg.ID]peerInvariantState
 	forceClose  []float64
 	forceRandom []float64
+	invariantWarmupUpdates int
+	peerUpdateCounts       map[peerpkg.ID]int
 }
 
 type peerInvariantState struct {
@@ -61,14 +63,16 @@ func NewService(h hostpkg.Host, cfg *Config) *Service {
 		}
 	}
 	s := &Service{
-		h:           h,
-		protocol:    proto,
-		timeout:     t,
-		peerStates:  make(map[peerpkg.ID]*VivaldiState),
-		peerRTTms:   make(map[peerpkg.ID]float64),
-		closePeers:  make(map[peerpkg.ID]struct{}),
-		randomPeers: make(map[peerpkg.ID]struct{}),
-		peerMeta:    make(map[peerpkg.ID]peerInvariantState),
+		h:                    h,
+		protocol:             proto,
+		timeout:              t,
+		peerStates:           make(map[peerpkg.ID]*VivaldiState),
+		peerRTTms:            make(map[peerpkg.ID]float64),
+		closePeers:           make(map[peerpkg.ID]struct{}),
+		randomPeers:          make(map[peerpkg.ID]struct{}),
+		peerMeta:             make(map[peerpkg.ID]peerInvariantState),
+		invariantWarmupUpdates: 0,
+		peerUpdateCounts:       make(map[peerpkg.ID]int),
 	}
 	h.SetStreamHandler(proto, s.handleStream)
 	return s

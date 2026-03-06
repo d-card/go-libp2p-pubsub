@@ -75,6 +75,10 @@ func (s *Service) ExchangeAndUpdate(ctx context.Context, pid peerpkg.ID, cfg Upd
 	chosen := good[indexOfMedianDuration(good)]
 
 	s.lk.Lock()
+	updateCount := s.peerUpdateCounts[pid]
+	s.peerUpdateCounts[pid] = updateCount + 1
+	warmup := updateCount < s.invariantWarmupUpdates
+
 	if s.local == nil {
 		s.local = &VivaldiState{Coord: Coord{0, 0, 0}, Error: 1.0}
 	}
@@ -96,17 +100,25 @@ func (s *Service) ExchangeAndUpdate(ctx context.Context, pid peerpkg.ID, cfg Upd
 	}
 
 	if cfg.Newton {
+		// IN1, IN2 and IN3 are treated as soft invariants during warmup (only log),
+		// and as hard invariants afterwards (log + reject).
 		if err := s.checkIN2(pid, chosen.coord, cfg); err != nil {
 			s.logInvariantReject(pid, "IN2", err.Error())
-			return nil, err
+			if !warmup {
+				return nil, err
+			}
 		}
 		if err := s.checkIN1(pid, chosen.coord, cfg); err != nil {
 			s.logInvariantReject(pid, "IN1", err.Error())
-			return nil, err
+			if !warmup {
+				return nil, err
+			}
 		}
 		if err := s.checkIN3(pid, res.ForceMagnitude, cfg); err != nil {
 			s.logInvariantReject(pid, "IN3", err.Error())
-			return nil, err
+			if !warmup {
+				return nil, err
+			}
 		}
 	}
 

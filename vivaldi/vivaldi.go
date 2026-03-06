@@ -4,6 +4,7 @@ package vivaldi
 import (
 	"fmt"
 	"math"
+	"math/rand"
 )
 
 // Coord represents a 2D Euclidean coordinate with a height component.
@@ -154,7 +155,8 @@ func hvUnit(a Coord) Coord {
 	n := hvNorm(a)
 	if n == 0 {
 		// As in Vivaldi, break ties randomly if colocated.
-		return Coord{X: 1, Y: 0, H: 0}
+		theta := rand.Float64() * 2 * math.Pi
+		return Coord{X: math.Cos(theta), Y: math.Sin(theta), H: 0}
 	}
 	return hvScale(a, 1.0/n)
 }
