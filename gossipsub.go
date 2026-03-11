@@ -1479,7 +1479,11 @@ func (gs *GossipSubRouter) rpcs(msg *Message) iter.Seq2[peer.ID, *RPC] {
 		// override the default selection. If SPREAD selects fewer than the configured threshold,
 		// fill with peers from the default gossipsub set.
 		if gs.gossipProtocolChoice == SPREAD && msg.Spread {
-			clusterPeers, interClusterPeers := gs.extensions.spreadState.GetPropagationPeers(topic, gs.p.host.ID())
+			useAngular := false
+			if gs.spreadPropagation != nil && gs.spreadPropagation.config != nil {
+				useAngular = gs.spreadPropagation.config.UseAngularInterPeers
+			}
+			clusterPeers, interClusterPeers := gs.extensions.spreadState.GetPropagationPeers(topic, gs.p.host.ID(), useAngular)
 			if gs.spreadPropagation == nil {
 				gs.spreadPropagation = NewSpreadPropagation(nil)
 			}

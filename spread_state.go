@@ -28,6 +28,9 @@ type SpreadState struct {
 	clusteringConfig *SpreadClusteringConfig
 	sortedKnownByRTT []peer.ID
 	sortedKnownSet   map[peer.ID]struct{}
+	angleBuckets     map[int][]peer.ID
+	angleBucketSize  float64
+	anglePctPerBucket float64
 	cacheDirty       bool
 }
 
@@ -55,17 +58,26 @@ type SpreadClusteringConfig struct {
 	// NumRings controls equal-sized ring partitioning of non-cluster known peers.
 	// Rings are unused now but can be explored in the future.
 	NumRings int
+
+	// InterAngleDegrees is the bucket size (in degrees) used to pick inter-cluster peers.
+	InterAngleDegrees float64
+	// InterPctPerAngle is the fraction of (topic peers excluding self) to pick per angle bucket.
+	InterPctPerAngle float64
 }
 
 const (
-	DefaultSpreadClusterPct = 0.25
+	DefaultSpreadClusterPct = 0.1
 	DefaultSpreadNumRings   = 3
+	DefaultSpreadInterAngleDegrees = 45
+	DefaultSpreadInterPctPerAngle  = 0.10
 )
 
 func DefaultSpreadClusteringConfig() *SpreadClusteringConfig {
 	return &SpreadClusteringConfig{
 		ClusterPct: DefaultSpreadClusterPct,
 		NumRings:   DefaultSpreadNumRings,
+		InterAngleDegrees: DefaultSpreadInterAngleDegrees,
+		InterPctPerAngle:  DefaultSpreadInterPctPerAngle,
 	}
 }
 
@@ -79,6 +91,12 @@ func sanitizeSpreadClusteringConfig(cfg *SpreadClusteringConfig) *SpreadClusteri
 	}
 	if cfg.NumRings > 0 {
 		out.NumRings = cfg.NumRings
+	}
+	if cfg.InterAngleDegrees > 0 && cfg.InterAngleDegrees <= 360 {
+		out.InterAngleDegrees = cfg.InterAngleDegrees
+	}
+	if cfg.InterPctPerAngle > 0 && cfg.InterPctPerAngle <= 1 {
+		out.InterPctPerAngle = cfg.InterPctPerAngle
 	}
 	return out
 }
@@ -301,10 +319,13 @@ func (s *SpreadState) ShutdownVivaldi() {
 }
 
 // GetPropagationPeers returns cluster peers and inter-cluster peers for topic.
-func (s *SpreadState) GetPropagationPeers(topic string, self peer.ID) ([]peer.ID, []peer.ID) {
+// If useAngularInter is true, inter-cluster peers are chosen using angular buckets
+// around the Vivaldi coordinate; otherwise the distance-only ordering is used.
+func (s *SpreadState) GetPropagationPeers(topic string, self peer.ID, useAngularInter bool) ([]peer.ID, []peer.ID) {
 
 	// Refresh sorted distance cache before getting propagation peers.
 	s.refreshDistanceCache(self)
+	s.refreshAngleCache(self)
 
 	// Get topic peers
 	s.lk.RLock()
@@ -364,23 +385,82 @@ func (s *SpreadState) GetPropagationPeers(topic string, self peer.ID) ([]peer.ID
 		clusterSet[p] = struct{}{}
 	}
 
-	// Get inter-cluster peers: first the known ones in equal-sized rings, then the unknown ones.
-	knownRemainder := append([]peer.ID(nil), knownInTopic[clusterSize:]...)
+	// Distance-based ordering only.
+	ringInter := func() ([]peer.ID, []peer.ID) {
+		knownRemainder := append([]peer.ID(nil), knownInTopic[clusterSize:]...)
 
-	unknownInTopic := make([]peer.ID, 0, len(topicSet))
-	for p := range topicSet {
-		if p == self {
-			continue
+		unknownInTopic := make([]peer.ID, 0, len(topicSet))
+		for p := range topicSet {
+			if p == self {
+				continue
+			}
+			if _, inCluster := clusterSet[p]; inCluster {
+				continue
+			}
+			if _, known := knownSet[p]; known {
+				continue
+			}
+			unknownInTopic = append(unknownInTopic, p)
 		}
-		if _, inCluster := clusterSet[p]; inCluster {
-			continue
-		}
-		if _, known := knownSet[p]; known {
-			continue
-		}
-		unknownInTopic = append(unknownInTopic, p)
+		interPeers := append(knownRemainder, unknownInTopic...)
+		return clusterPeers, interPeers
 	}
-	interPeers := append(knownRemainder, unknownInTopic...)
+
+	if !useAngularInter {
+		return ringInter()
+	}
+
+	// Get inter-cluster peers using angle buckets.
+	numBuckets := int(math.Ceil(360.0 / cfg.InterAngleDegrees))
+	if numBuckets < 1 {
+		numBuckets = 1
+	}
+
+	// If angle buckets are not ready or Vivaldi is disabled, fall back
+	if s.vivaldiService == nil || s.angleBuckets == nil || cfg.InterAngleDegrees <= 0 || cfg.InterPctPerAngle <= 0 {
+		return ringInter()
+	}
+
+	interPeers := make([]peer.ID, 0)
+	used := make(map[peer.ID]struct{})
+	for b := 0; b < numBuckets; b++ {
+		// Count how many topic peers fall into this angle bucket (excluding self).
+		bucketTopicCount := 0
+		for _, p := range s.angleBuckets[b] {
+			if p == self {
+				continue
+			}
+			if _, ok := topicSet[p]; !ok {
+				continue
+			}
+			bucketTopicCount++
+		}
+		if bucketTopicCount == 0 {
+			continue
+		}
+		kPerAngle := int(math.Ceil(float64(bucketTopicCount) * cfg.InterPctPerAngle))
+		if kPerAngle < 1 {
+			kPerAngle = 1
+		}
+		picked := 0
+		for _, p := range s.angleBuckets[b] {
+			if picked >= kPerAngle {
+				break
+			}
+			if _, ok := topicSet[p]; !ok {
+				continue
+			}
+			if _, inCluster := clusterSet[p]; inCluster {
+				continue
+			}
+			if _, already := used[p]; already {
+				continue
+			}
+			interPeers = append(interPeers, p)
+			used[p] = struct{}{}
+			picked++
+		}
+	}
 	return clusterPeers, interPeers
 }
 
@@ -450,6 +530,7 @@ func (s *SpreadState) refreshDistanceCache(self peer.ID) {
 		s.lk.Lock()
 		s.sortedKnownByRTT = nil
 		s.sortedKnownSet = nil
+		s.angleBuckets = nil
 		s.cacheDirty = false
 		s.lk.Unlock()
 		return
@@ -461,6 +542,7 @@ func (s *SpreadState) refreshDistanceCache(self peer.ID) {
 		s.lk.Lock()
 		s.sortedKnownByRTT = nil
 		s.sortedKnownSet = nil
+		s.angleBuckets = nil
 		s.cacheDirty = false
 		s.lk.Unlock()
 		return
@@ -504,6 +586,94 @@ func (s *SpreadState) refreshDistanceCache(self peer.ID) {
 	s.sortedKnownByRTT = sorted
 	s.sortedKnownSet = knownSet
 	s.cacheDirty = false
+	s.lk.Unlock()
+}
+
+func (s *SpreadState) refreshAngleCache(self peer.ID) {
+	s.lk.RLock()
+	needsRefresh := s.cacheDirty
+	vsvc := s.vivaldiService
+	cfg := s.clusteringConfig
+	peers := make([]peer.ID, 0, len(s.peers))
+	for p := range s.peers {
+		peers = append(peers, p)
+	}
+	s.lk.RUnlock()
+
+	if !needsRefresh && s.angleBuckets != nil && s.angleBucketSize == cfg.InterAngleDegrees && s.anglePctPerBucket == cfg.InterPctPerAngle {
+		return
+	}
+	if vsvc == nil || cfg == nil || cfg.InterAngleDegrees <= 0 || cfg.InterAngleDegrees > 360 {
+		s.lk.Lock()
+		s.angleBuckets = nil
+		s.angleBucketSize = 0
+		s.anglePctPerBucket = 0
+		s.lk.Unlock()
+		return
+	}
+	local := vsvc.GetLocalState()
+	if local == nil {
+		s.lk.Lock()
+		s.angleBuckets = nil
+		s.angleBucketSize = cfg.InterAngleDegrees
+		s.anglePctPerBucket = cfg.InterPctPerAngle
+		s.lk.Unlock()
+		return
+	}
+
+	numBuckets := int(math.Ceil(360.0 / cfg.InterAngleDegrees))
+	if numBuckets < 1 {
+		numBuckets = 1
+	}
+	type entry struct {
+		id   peer.ID
+		dist float64
+	}
+	byBucket := make(map[int][]entry, numBuckets)
+
+	radPerBucket := (cfg.InterAngleDegrees * math.Pi) / 180.0
+	for _, p := range peers {
+		if p == self {
+			continue
+		}
+		st := vsvc.GetPeerState(p)
+		if st == nil {
+			continue
+		}
+		dx := st.Coord.X - local.Coord.X
+		dy := st.Coord.Y - local.Coord.Y
+		theta := math.Atan2(dy, dx)
+		if theta < 0 {
+			theta += 2 * math.Pi
+		}
+		b := int(theta / radPerBucket)
+		if b < 0 {
+			b = 0
+		}
+		if b >= numBuckets {
+			b = numBuckets - 1
+		}
+		byBucket[b] = append(byBucket[b], entry{
+			id:   p,
+			dist: vivaldi.Distance(local.Coord, st.Coord),
+		})
+	}
+
+	out := make(map[int][]peer.ID, numBuckets)
+	for b := 0; b < numBuckets; b++ {
+		ents := byBucket[b]
+		sort.Slice(ents, func(i, j int) bool { return ents[i].dist < ents[j].dist })
+		ids := make([]peer.ID, 0, len(ents))
+		for _, e := range ents {
+			ids = append(ids, e.id)
+		}
+		out[b] = ids
+	}
+
+	s.lk.Lock()
+	s.angleBuckets = out
+	s.angleBucketSize = cfg.InterAngleDegrees
+	s.anglePctPerBucket = cfg.InterPctPerAngle
 	s.lk.Unlock()
 }
 

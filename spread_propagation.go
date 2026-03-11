@@ -21,6 +21,11 @@ type SpreadConfig struct {
 	// Number of times a seen SPREAD message may be re-propagated as a duplicate.
 	// This is the number of extra forwards after the first forward.
 	DuplicateRepropagation int
+
+	// UseAngularInterPeers toggles whether inter-cluster peers are drawn using
+	// angular buckets from the spread clustering state instead of distance-only 
+	// ordering.
+	UseAngularInterPeers bool
 }
 
 // Default configuration values
@@ -45,6 +50,7 @@ func DefaultSpreadConfig() *SpreadConfig {
 		InterProb:              DefaultSpreadInterProb,
 		FallbackThreshold:      DefaultSpreadFallbackMin,
 		DuplicateRepropagation: DefaultSpreadDuplicateRepropagation,
+		UseAngularInterPeers:   false,
 	}
 }
 
@@ -71,6 +77,7 @@ func sanitizeSpreadConfig(cfg *SpreadConfig) *SpreadConfig {
 	if cfg.DuplicateRepropagation >= 0 {
 		out.DuplicateRepropagation = cfg.DuplicateRepropagation
 	}
+	out.UseAngularInterPeers = cfg.UseAngularInterPeers
 	return out
 }
 
