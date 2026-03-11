@@ -13,6 +13,7 @@ import (
 	"math/rand"
 	"net"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"sync"
@@ -29,14 +30,40 @@ import (
 const experimentTopic = "spread-vs-gossipsub-simnet"
 
 const (
+	SPREAD_SIMNET_EXPORT_PATH_ENV           = "SPREAD_SIMNET_EXPORT_PATH"
+	SPREAD_SIMNET_RUN_ID_ENV                = "SPREAD_SIMNET_RUN_ID"
+	SPREAD_SIMNET_GIT_COMMIT_ENV            = "SPREAD_SIMNET_GIT_COMMIT"
 	SPREAD_SIMNET_NODES                     = 20               // Number of nodes
-	SPREAD_SIMNET_TRIALS                    = 500                // Number of messages published
-	SPREAD_SIMNET_WINDOW_SIZE               = 10                // Number of trials to aggregate in the same window (for understanding temporal evolution of metrics due to vivaldi warmup)
+	SPREAD_SIMNET_TRIALS                    = 500              // Number of messages published
+	SPREAD_SIMNET_WINDOW_SIZE               = 10               // Number of trials to aggregate in the same window (for understanding temporal evolution of metrics due to vivaldi warmup)
 	SPREAD_SIMNET_WARMUP_EVERY              = 0                // Number of trials between warm-up rounds of vivaldi
 	SPREAD_SIMNET_WARMUP_ROUNDS_PER_PUBLISH = 1                // Number of vivaldi rounds to warm up before each publish
 	SPREAD_SIMNET_SEED                      = 1337             // Random seed for topology generation (latencies and node regions)
 	SPREAD_SIMNET_LINK_MIBPS                = 20               // Link bandwidth in MiB/s for all links in the simnet topology
 	SPREAD_SIMNET_SCENARIO_TIMEOUT          = 10 * time.Minute // Overall timeout for each scenario
+)
+
+const (
+	SPREAD_CLUSTER_PCT             = "SPREAD_CLUSTER_PCT"
+	SPREAD_NUM_RINGS               = "SPREAD_NUM_RINGS"
+	SPREAD_INTRA_FANOUT            = "SPREAD_INTRA_FANOUT"
+	SPREAD_INTER_FANOUT            = "SPREAD_INTER_FANOUT"
+	SPREAD_INTRA_RHO               = "SPREAD_INTRA_RHO"
+	SPREAD_INTER_PROB              = "SPREAD_INTER_PROB"
+	SPREAD_FALLBACK_THRESHOLD      = "SPREAD_FALLBACK_THRESHOLD"
+	SPREAD_DUPLICATE_REPROPAGATION = "SPREAD_DUPLICATE_REPROPAGATION"
+	SPREAD_CC                      = "SPREAD_CC"
+	SPREAD_CE                      = "SPREAD_CE"
+	SPREAD_NEWTON                  = "SPREAD_NEWTON"
+	SPREAD_OUTLIER_THRESHOLD       = "SPREAD_OUTLIER_THRESHOLD"
+	SPREAD_SAMPLES                 = "SPREAD_SAMPLES"
+	SPREAD_INTERVAL_MS             = "SPREAD_INTERVAL_MS"
+	SPREAD_NEIGHBOR_SET_SIZE       = "SPREAD_NEIGHBOR_SET_SIZE"
+	SPREAD_IN1_THRESHOLD_MS        = "SPREAD_IN1_THRESHOLD_MS"
+	SPREAD_IN2_THRESHOLD_MS        = "SPREAD_IN2_THRESHOLD_MS"
+	SPREAD_IN3_MADK_RANDOM         = "SPREAD_IN3_MADK_RANDOM"
+	SPREAD_IN3_MADK_CLOSE          = "SPREAD_IN3_MADK_CLOSE"
+	SPREAD_IN3_MIN_SAMPLES         = "SPREAD_IN3_MIN_SAMPLES"
 )
 
 type experimentResult struct {
@@ -50,6 +77,50 @@ type experimentTopology struct {
 	hosts   []host.Host       // all hosts in the test
 	weights [][]time.Duration // symmetric matrix of direct pair latencies
 	closeFn func()
+}
+
+type spreadWindowSummary struct {
+	Window     int         `json:"window"`
+	TrialStart int         `json:"trial_start"`
+	TrialEnd   int         `json:"trial_end"`
+	Latency    metricStats `json:"latency"`
+	Stretch    metricStats `json:"stretch"`
+}
+
+type metricStats struct {
+	Min    float64 `json:"min"`
+	Mean   float64 `json:"mean"`
+	Max    float64 `json:"max"`
+	P50    float64 `json:"p50"`
+	P95    float64 `json:"p95"`
+	P99    float64 `json:"p99"`
+	StdDev float64 `json:"stddev"`
+}
+
+type spreadScenarioSummary struct {
+	Name    string                `json:"name"`
+	Latency metricStats           `json:"latency"`
+	Stretch metricStats           `json:"stretch"`
+	Windows []spreadWindowSummary `json:"windows,omitempty"`
+}
+
+type spreadExperimentExport struct {
+	RunID     string `json:"run_id,omitempty"`
+	GitCommit string `json:"git_commit,omitempty"`
+
+	GeneratedAt string `json:"generated_at"`
+
+	Nodes             int `json:"nodes"`
+	Trials            int `json:"trials"`
+	WindowSize        int `json:"window_size"`
+	Seed              int `json:"seed"`
+	WarmupEvery       int `json:"warmup_every"`
+	WarmupPerPublish  int `json:"warmup_rounds_per_publish"`
+	LinkMiBps         int `json:"link_mibps"`
+	ScenarioTimeoutMs int `json:"scenario_timeout_ms"`
+
+	Gossipsub spreadScenarioSummary `json:"gossipsub"`
+	Spread    spreadScenarioSummary `json:"spread"`
 }
 
 func TestSimnetSpreadVsGossipsubLatencyStretch(t *testing.T) {
@@ -89,15 +160,17 @@ func TestSimnetSpreadVsGossipsubLatencyStretch(t *testing.T) {
 	t.Logf("spread: full scenario completed in %s", time.Since(spreadStartTime))
 
 	// Print results
-	t.Logf("overall gossipsub: latency p50=%.2fms p95=%.2fms; stretch p50=%.3f p95=%.3f",
-		percentile(gsRes.latencyMS, 0.50), percentile(gsRes.latencyMS, 0.95),
-		percentile(gsRes.stretch, 0.50), percentile(gsRes.stretch, 0.95))
-	t.Logf("overall spread: latency p50=%.2fms p95=%.2fms; stretch p50=%.3f p95=%.3f",
-		percentile(spreadRes.latencyMS, 0.50), percentile(spreadRes.latencyMS, 0.95),
-		percentile(spreadRes.stretch, 0.50), percentile(spreadRes.stretch, 0.95))
+	logScenarioStats(t, "overall gossipsub", summarizeScenario("gossipsub", gsRes, windowSize))
+	logScenarioStats(t, "overall spread", summarizeScenario("spread", spreadRes, windowSize))
 
 	logWindowStats(t, "gossipsub", gsRes, windowSize)
 	logWindowStats(t, "spread", spreadRes, windowSize)
+
+	if exportPath, err := maybeWriteSpreadExperimentExport(gsRes, spreadRes, nodeCount, trials, windowSize, int(seed)); err != nil {
+		t.Fatalf("write %s: %v", SPREAD_SIMNET_EXPORT_PATH_ENV, err)
+	} else if exportPath != "" {
+		t.Logf("wrote spread experiment export to %s", exportPath)
+	}
 }
 
 type scenarioConfig struct {
@@ -137,32 +210,9 @@ func runScenario(t *testing.T, topo experimentTopology, cfg scenarioConfig) expe
 			opts = append(opts,
 				WithProtocolChoice(SPREAD),
 				withSpreadExtensionAdvertise(),
-				WithSpreadClusteringConfig(&SpreadClusteringConfig{
-					ClusterPct: 0.25,
-					NumRings:   4, // Not used
-				}),
-				WithSpreadPropagationConfig(&SpreadConfig{
-					IntraFanout:            DefaultSpreadIntraFanout,
-					InterFanout:            DefaultSpreadInterFanout,
-					IntraRho:               DefaultSpreadIntraRho,
-					InterProb:              DefaultSpreadInterProb,
-					FallbackThreshold:      DefaultSpreadFallbackMin,
-					DuplicateRepropagation: 5,
-				}),
-				WithVivaldi(vsvc, &VivaldiConfig{
-					Cc:               0.25,
-					Ce:               0.25,
-					Newton:           false,
-					OutlierThreshold: 0,
-					Samples:          1,
-					Interval:         150 * time.Millisecond,
-					NeighborSetSize:  24,
-					IN1ThresholdMS:   20,
-					IN2ThresholdMS:   35,
-					IN3MADKRandom:    5,
-					IN3MADKClose:     8,
-					IN3MinSamples:    4,
-				}),
+				WithSpreadClusteringConfig(spreadClusteringConfigFromEnv()),
+				WithSpreadPropagationConfig(spreadPropagationConfigFromEnv()),
+				WithVivaldi(vsvc, spreadVivaldiConfigFromEnv()),
 			)
 		}
 		psubs = append(psubs, getGossipsub(ctx, h, opts...))
@@ -524,34 +574,216 @@ func logWindowStats(t *testing.T, name string, res experimentResult, windowSize 
 	for _, w := range windows {
 		lats := res.windowLatencyMS[w]
 		st := res.windowStretch[w]
-		t.Logf("%s window=%d trials=%d..%d latency p50=%.2fms p95=%.2fms stretch p50=%.3f p95=%.3f",
+		latStats := computeMetricStats(lats)
+		stStats := computeMetricStats(st)
+		t.Logf("%s window=%d trials=%d..%d latency[min=%.2f mean=%.2f max=%.2f p50=%.2f p95=%.2f p99=%.2f std=%.2f]ms stretch[min=%.3f mean=%.3f max=%.3f p50=%.3f p95=%.3f p99=%.3f std=%.3f]",
 			name, w, w*windowSize, (w+1)*windowSize-1,
-			percentile(lats, 0.50), percentile(lats, 0.95),
-			percentile(st, 0.50), percentile(st, 0.95),
+			latStats.Min, latStats.Mean, latStats.Max, latStats.P50, latStats.P95, latStats.P99, latStats.StdDev,
+			stStats.Min, stStats.Mean, stStats.Max, stStats.P50, stStats.P95, stStats.P99, stStats.StdDev,
 		)
 	}
 }
 
-func percentile(xs []float64, p float64) float64 {
+func logScenarioStats(t *testing.T, prefix string, s spreadScenarioSummary) {
+	t.Logf("%s: latency[min=%.2f mean=%.2f max=%.2f p50=%.2f p95=%.2f p99=%.2f std=%.2f]ms stretch[min=%.3f mean=%.3f max=%.3f p50=%.3f p95=%.3f p99=%.3f std=%.3f]",
+		prefix,
+		s.Latency.Min, s.Latency.Mean, s.Latency.Max, s.Latency.P50, s.Latency.P95, s.Latency.P99, s.Latency.StdDev,
+		s.Stretch.Min, s.Stretch.Mean, s.Stretch.Max, s.Stretch.P50, s.Stretch.P95, s.Stretch.P99, s.Stretch.StdDev,
+	)
+}
+
+func buildSpreadExperimentExport(gsRes, spreadRes experimentResult, nodeCount, trials, windowSize, seed int) spreadExperimentExport {
+	return spreadExperimentExport{
+		GeneratedAt:       time.Now().UTC().Format(time.RFC3339Nano),
+		Nodes:             nodeCount,
+		Trials:            trials,
+		WindowSize:        windowSize,
+		Seed:              seed,
+		WarmupEvery:       envInt("SPREAD_SIMNET_WARMUP_EVERY", SPREAD_SIMNET_WARMUP_EVERY),
+		WarmupPerPublish:  envInt("SPREAD_SIMNET_WARMUP_ROUNDS_PER_PUBLISH", SPREAD_SIMNET_WARMUP_ROUNDS_PER_PUBLISH),
+		LinkMiBps:         envInt("SPREAD_SIMNET_LINK_MIBPS", SPREAD_SIMNET_LINK_MIBPS),
+		ScenarioTimeoutMs: int(SPREAD_SIMNET_SCENARIO_TIMEOUT / time.Millisecond),
+		Gossipsub:         summarizeScenario("gossipsub", gsRes, windowSize),
+		Spread:            summarizeScenario("spread", spreadRes, windowSize),
+	}
+}
+
+func summarizeScenario(name string, res experimentResult, windowSize int) spreadScenarioSummary {
+	out := spreadScenarioSummary{
+		Name:    name,
+		Latency: computeMetricStats(res.latencyMS),
+		Stretch: computeMetricStats(res.stretch),
+	}
+
+	windows := make([]int, 0, len(res.windowLatencyMS))
+	for w := range res.windowLatencyMS {
+		windows = append(windows, w)
+	}
+	sort.Ints(windows)
+	out.Windows = make([]spreadWindowSummary, 0, len(windows))
+	for _, w := range windows {
+		lats := res.windowLatencyMS[w]
+		st := res.windowStretch[w]
+		out.Windows = append(out.Windows, spreadWindowSummary{
+			Window:     w,
+			TrialStart: w * windowSize,
+			TrialEnd:   (w+1)*windowSize - 1,
+			Latency:    computeMetricStats(lats),
+			Stretch:    computeMetricStats(st),
+		})
+	}
+	return out
+}
+
+func computeMetricStats(xs []float64) metricStats {
 	if len(xs) == 0 {
+		return metricStats{}
+	}
+	sorted := append([]float64(nil), xs...)
+	sort.Float64s(sorted)
+
+	sum := 0.0
+	for _, x := range sorted {
+		sum += x
+	}
+	mean := sum / float64(len(sorted))
+
+	varianceSum := 0.0
+	for _, x := range sorted {
+		d := x - mean
+		varianceSum += d * d
+	}
+
+	return metricStats{
+		Min:    sorted[0],
+		Mean:   mean,
+		Max:    sorted[len(sorted)-1],
+		P50:    quantileSorted(sorted, 0.50),
+		P95:    quantileSorted(sorted, 0.95),
+		P99:    quantileSorted(sorted, 0.99),
+		StdDev: math.Sqrt(varianceSum / float64(len(sorted))),
+	}
+}
+
+func writeSpreadExperimentExport(path string, doc spreadExperimentExport) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("create export dir %q: %w", dir, err)
+	}
+
+	b, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal export doc: %w", err)
+	}
+	b = append(b, '\n')
+
+	return writeAtomicFile(path, b, 0o644)
+}
+
+func maybeWriteSpreadExperimentExport(gsRes, spreadRes experimentResult, nodeCount, trials, windowSize, seed int) (string, error) {
+	exportPath := os.Getenv(SPREAD_SIMNET_EXPORT_PATH_ENV)
+	if exportPath == "" {
+		return "", nil
+	}
+	doc := buildSpreadExperimentExport(gsRes, spreadRes, nodeCount, trials, windowSize, seed)
+	doc.RunID = os.Getenv(SPREAD_SIMNET_RUN_ID_ENV)
+	doc.GitCommit = os.Getenv(SPREAD_SIMNET_GIT_COMMIT_ENV)
+	return exportPath, writeSpreadExperimentExport(exportPath, doc)
+}
+
+func writeAtomicFile(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	base := filepath.Base(path)
+	tmp := filepath.Join(dir, "."+base+".tmp")
+
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, perm)
+	if err != nil {
+		return fmt.Errorf("open temp file %q: %w", tmp, err)
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("write temp file %q: %w", tmp, err)
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("sync temp file %q: %w", tmp, err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close temp file %q: %w", tmp, err)
+	}
+
+	if err := os.Rename(tmp, path); err != nil {
+		return fmt.Errorf("rename %q -> %q: %w", tmp, path, err)
+	}
+
+	// Sync parent directory to persist the rename operation.
+	df, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("open parent dir %q: %w", dir, err)
+	}
+	if err := df.Sync(); err != nil {
+		_ = df.Close()
+		return fmt.Errorf("sync parent dir %q: %w", dir, err)
+	}
+	if err := df.Close(); err != nil {
+		return fmt.Errorf("close parent dir %q: %w", dir, err)
+	}
+	return nil
+}
+
+func quantileSorted(sorted []float64, p float64) float64 {
+	if len(sorted) == 0 {
 		return 0
 	}
-	cpy := append([]float64(nil), xs...)
-	sort.Float64s(cpy)
 	if p <= 0 {
-		return cpy[0]
+		return sorted[0]
 	}
 	if p >= 1 {
-		return cpy[len(cpy)-1]
+		return sorted[len(sorted)-1]
 	}
-	idx := int(math.Ceil(p*float64(len(cpy)))) - 1
+	idx := int(math.Ceil(p*float64(len(sorted)))) - 1
 	if idx < 0 {
 		idx = 0
 	}
-	if idx >= len(cpy) {
-		idx = len(cpy) - 1
+	if idx >= len(sorted) {
+		idx = len(sorted) - 1
 	}
-	return cpy[idx]
+	return sorted[idx]
+}
+
+func spreadClusteringConfigFromEnv() *SpreadClusteringConfig {
+	return &SpreadClusteringConfig{
+		ClusterPct: envFloat(SPREAD_CLUSTER_PCT, 0.25),
+		NumRings:   envInt(SPREAD_NUM_RINGS, 4),
+	}
+}
+
+func spreadPropagationConfigFromEnv() *SpreadConfig {
+	return &SpreadConfig{
+		IntraFanout:            envInt(SPREAD_INTRA_FANOUT, DefaultSpreadIntraFanout),
+		InterFanout:            envInt(SPREAD_INTER_FANOUT, DefaultSpreadInterFanout),
+		IntraRho:               envFloat(SPREAD_INTRA_RHO, DefaultSpreadIntraRho),
+		InterProb:              envFloat(SPREAD_INTER_PROB, DefaultSpreadInterProb),
+		FallbackThreshold:      envInt(SPREAD_FALLBACK_THRESHOLD, DefaultSpreadFallbackMin),
+		DuplicateRepropagation: envInt(SPREAD_DUPLICATE_REPROPAGATION, 5),
+	}
+}
+
+func spreadVivaldiConfigFromEnv() *VivaldiConfig {
+	return &VivaldiConfig{
+		Cc:               envFloat(SPREAD_CC, 0.25),
+		Ce:               envFloat(SPREAD_CE, 0.25),
+		Newton:           envBool(SPREAD_NEWTON, false),
+		OutlierThreshold: envFloat(SPREAD_OUTLIER_THRESHOLD, 0),
+		Samples:          envInt(SPREAD_SAMPLES, 1),
+		Interval:         time.Duration(envInt(SPREAD_INTERVAL_MS, 150)) * time.Millisecond,
+		NeighborSetSize:  envInt(SPREAD_NEIGHBOR_SET_SIZE, 24),
+		IN1ThresholdMS:   envFloat(SPREAD_IN1_THRESHOLD_MS, 20),
+		IN2ThresholdMS:   envFloat(SPREAD_IN2_THRESHOLD_MS, 35),
+		IN3MADKRandom:    envFloat(SPREAD_IN3_MADK_RANDOM, 5),
+		IN3MADKClose:     envFloat(SPREAD_IN3_MADK_CLOSE, 8),
+		IN3MinSamples:    envInt(SPREAD_IN3_MIN_SAMPLES, 4),
+	}
 }
 
 func envInt(key string, def int) int {
@@ -560,6 +792,30 @@ func envInt(key string, def int) int {
 		return def
 	}
 	v, err := strconv.Atoi(raw)
+	if err != nil {
+		return def
+	}
+	return v
+}
+
+func envFloat(key string, def float64) float64 {
+	raw := os.Getenv(key)
+	if raw == "" {
+		return def
+	}
+	v, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		return def
+	}
+	return v
+}
+
+func envBool(key string, def bool) bool {
+	raw := os.Getenv(key)
+	if raw == "" {
+		return def
+	}
+	v, err := strconv.ParseBool(raw)
 	if err != nil {
 		return def
 	}
