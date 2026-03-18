@@ -14,7 +14,6 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"sync"
 	"testing"
@@ -35,7 +34,6 @@ const (
 	SPREAD_SIMNET_GIT_COMMIT_ENV            = "SPREAD_SIMNET_GIT_COMMIT"
 	SPREAD_SIMNET_NODES                     = 20               // Number of nodes
 	SPREAD_SIMNET_TRIALS                    = 500              // Number of messages published
-	SPREAD_SIMNET_WINDOW_SIZE               = 10               // Number of trials to aggregate in the same window (for understanding temporal evolution of metrics due to vivaldi warmup)
 	SPREAD_SIMNET_WARMUP_EVERY              = 0                // Number of trials between warm-up rounds of vivaldi
 	SPREAD_SIMNET_WARMUP_ROUNDS_PER_PUBLISH = 1                // Number of vivaldi rounds to warm up before each publish
 	SPREAD_SIMNET_SEED                      = 1337             // Random seed for topology generation (latencies and node regions)
@@ -66,42 +64,27 @@ const (
 	SPREAD_IN3_MIN_SAMPLES         = "SPREAD_IN3_MIN_SAMPLES"
 )
 
+type delivery struct {
+	Dst       int     `json:"dst"`        // original node ID from nodes.json
+	LatencyMS float64 `json:"latency_ms"` // observed one-way latency in ms
+	Stretch   float64 `json:"stretch"`    // observed / direct pair latency
+}
+
+type trialResult struct {
+	Trial      int        `json:"trial"`
+	Src        int        `json:"src"`        // original node ID from nodes.json
+	Deliveries []delivery `json:"deliveries"` // one per receiver
+}
+
 type experimentResult struct {
-	latencyMS       []float64         // latency in milliseconds for each received message
-	stretch         []float64         // stretch for each received message
-	windowLatencyMS map[int][]float64 // latency in milliseconds for each received message, grouped by window
-	windowStretch   map[int][]float64 // stretch for each received message, grouped by window
+	trials []trialResult
 }
 
 type experimentTopology struct {
 	hosts   []host.Host       // all hosts in the test
 	weights [][]time.Duration // symmetric matrix of direct pair latencies
+	nodeIDs []int             // original node IDs from nodes.json (index → ID)
 	closeFn func()
-}
-
-type spreadWindowSummary struct {
-	Window     int         `json:"window"`
-	TrialStart int         `json:"trial_start"`
-	TrialEnd   int         `json:"trial_end"`
-	Latency    metricStats `json:"latency"`
-	Stretch    metricStats `json:"stretch"`
-}
-
-type metricStats struct {
-	Min    float64 `json:"min"`
-	Mean   float64 `json:"mean"`
-	Max    float64 `json:"max"`
-	P50    float64 `json:"p50"`
-	P95    float64 `json:"p95"`
-	P99    float64 `json:"p99"`
-	StdDev float64 `json:"stddev"`
-}
-
-type spreadScenarioSummary struct {
-	Name    string                `json:"name"`
-	Latency metricStats           `json:"latency"`
-	Stretch metricStats           `json:"stretch"`
-	Windows []spreadWindowSummary `json:"windows,omitempty"`
 }
 
 type spreadExperimentExport struct {
@@ -110,17 +93,17 @@ type spreadExperimentExport struct {
 
 	GeneratedAt string `json:"generated_at"`
 
-	Nodes             int `json:"nodes"`
-	Trials            int `json:"trials"`
-	WindowSize        int `json:"window_size"`
-	Seed              int `json:"seed"`
-	WarmupEvery       int `json:"warmup_every"`
-	WarmupPerPublish  int `json:"warmup_rounds_per_publish"`
-	LinkMiBps         int `json:"link_mibps"`
-	ScenarioTimeoutMs int `json:"scenario_timeout_ms"`
+	Nodes             int   `json:"nodes"`
+	Trials            int   `json:"trials"`
+	Seed              int   `json:"seed"`
+	WarmupEvery       int   `json:"warmup_every"`
+	WarmupPerPublish  int   `json:"warmup_rounds_per_publish"`
+	LinkMiBps         int   `json:"link_mibps"`
+	ScenarioTimeoutMs int   `json:"scenario_timeout_ms"`
+	NodeIDs           []int `json:"node_ids"`
 
-	Gossipsub spreadScenarioSummary `json:"gossipsub"`
-	Spread    spreadScenarioSummary `json:"spread"`
+	Gossipsub []trialResult `json:"gossipsub"`
+	Spread    []trialResult `json:"spread"`
 }
 
 func TestSimnetSpreadVsGossipsubLatencyStretch(t *testing.T) {
@@ -128,7 +111,6 @@ func TestSimnetSpreadVsGossipsubLatencyStretch(t *testing.T) {
 	// Test parameters
 	nodeCount := envInt("SPREAD_SIMNET_NODES", SPREAD_SIMNET_NODES)
 	trials := envInt("SPREAD_SIMNET_TRIALS", SPREAD_SIMNET_TRIALS)
-	windowSize := envInt("SPREAD_SIMNET_WINDOW_SIZE", SPREAD_SIMNET_WINDOW_SIZE)
 	seed := int64(envInt("SPREAD_SIMNET_SEED", SPREAD_SIMNET_SEED))
 
 	// Run gossipsub
@@ -138,12 +120,11 @@ func TestSimnetSpreadVsGossipsubLatencyStretch(t *testing.T) {
 	gsRes := runScenario(t, gsTopo, scenarioConfig{
 		name:             "gossipsub",
 		trials:           trials,
-		windowSize:       windowSize,
 		useSpread:        false,
 		warmupEvery:      0,
 		warmupPerPublish: 0,
 	})
-	t.Logf("gossipsub: full scenario completed in %s", time.Since(gossipsubStartTime))
+	t.Logf("gossipsub: %d trials completed in %s", trials, time.Since(gossipsubStartTime))
 
 	// Run spread
 	spreadStartTime := time.Now()
@@ -152,31 +133,33 @@ func TestSimnetSpreadVsGossipsubLatencyStretch(t *testing.T) {
 	spreadRes := runScenario(t, spreadTopo, scenarioConfig{
 		name:             "spread",
 		trials:           trials,
-		windowSize:       windowSize,
 		useSpread:        true,
 		warmupEvery:      envInt("SPREAD_SIMNET_WARMUP_EVERY", SPREAD_SIMNET_WARMUP_EVERY),
 		warmupPerPublish: envInt("SPREAD_SIMNET_WARMUP_ROUNDS_PER_PUBLISH", SPREAD_SIMNET_WARMUP_ROUNDS_PER_PUBLISH),
 	})
-	t.Logf("spread: full scenario completed in %s", time.Since(spreadStartTime))
+	t.Logf("spread: %d trials completed in %s", trials, time.Since(spreadStartTime))
 
-	// Print results
-	logScenarioStats(t, "overall gossipsub", summarizeScenario("gossipsub", gsRes, windowSize))
-	logScenarioStats(t, "overall spread", summarizeScenario("spread", spreadRes, windowSize))
+	t.Logf("gossipsub: %d raw observations", countDeliveries(gsRes))
+	t.Logf("spread:    %d raw observations", countDeliveries(spreadRes))
 
-	logWindowStats(t, "gossipsub", gsRes, windowSize)
-	logWindowStats(t, "spread", spreadRes, windowSize)
-
-	if exportPath, err := maybeWriteSpreadExperimentExport(gsRes, spreadRes, nodeCount, trials, windowSize, int(seed)); err != nil {
+	if exportPath, err := maybeWriteSpreadExperimentExport(gsRes, spreadRes, gsTopo.nodeIDs, nodeCount, trials, int(seed)); err != nil {
 		t.Fatalf("write %s: %v", SPREAD_SIMNET_EXPORT_PATH_ENV, err)
 	} else if exportPath != "" {
 		t.Logf("wrote spread experiment export to %s", exportPath)
 	}
 }
 
+func countDeliveries(res experimentResult) int {
+	n := 0
+	for _, tr := range res.trials {
+		n += len(tr.Deliveries)
+	}
+	return n
+}
+
 type scenarioConfig struct {
 	name             string
 	trials           int
-	windowSize       int
 	useSpread        bool
 	warmupEvery      int
 	warmupPerPublish int
@@ -242,10 +225,7 @@ func runScenario(t *testing.T, topo experimentTopology, cfg scenarioConfig) expe
 	time.Sleep(2 * time.Second)
 
 	res := experimentResult{
-		latencyMS:       make([]float64, 0, cfg.trials*(len(psubs)-1)),
-		stretch:         make([]float64, 0, cfg.trials*(len(psubs)-1)),
-		windowLatencyMS: make(map[int][]float64),
-		windowStretch:   make(map[int][]float64),
+		trials: make([]trialResult, 0, cfg.trials),
 	}
 
 	// Run trials
@@ -284,8 +264,11 @@ func runScenario(t *testing.T, topo experimentTopology, cfg scenarioConfig) expe
 			}
 		}
 
-		// Compute current window for results aggregation
-		window := trial / max(1, cfg.windowSize)
+		tr := trialResult{
+			Trial:      trial,
+			Src:        topo.nodeIDs[src],
+			Deliveries: make([]delivery, 0, len(psubs)-1),
+		}
 
 		// Wait for all subscribers to receive the message and collect results
 		for i := 0; i < len(psubs)-1; i++ {
@@ -294,21 +277,23 @@ func runScenario(t *testing.T, topo experimentTopology, cfg scenarioConfig) expe
 				t.Fatalf("%s: receive trial=%d source=%d: %v", cfg.name, trial, src, rr.err)
 			}
 
-			// Calculate latency as: recvResult.at - publish start time
 			obs := rr.at.Sub(start)
 			obsMS := float64(obs) / float64(time.Millisecond)
-			res.latencyMS = append(res.latencyMS, obsMS)
-			res.windowLatencyMS[window] = append(res.windowLatencyMS[window], obsMS)
 
-			// Compute stretch as: observed latency / direct pair latency between source and receiver
+			var st float64
 			base := topo.weights[src][rr.idx]
-			if base <= 0 {
-				continue
+			if base > 0 {
+				st = float64(obs) / float64(base)
 			}
-			st := float64(obs) / float64(base)
-			res.stretch = append(res.stretch, st)
-			res.windowStretch[window] = append(res.windowStretch[window], st)
+
+			tr.Deliveries = append(tr.Deliveries, delivery{
+				Dst:       topo.nodeIDs[rr.idx],
+				LatencyMS: obsMS,
+				Stretch:   st,
+			})
 		}
+
+		res.trials = append(res.trials, tr)
 	}
 
 	return res
@@ -407,8 +392,8 @@ func makeEthereumLikeTopology(t *testing.T, n int, seed int64) experimentTopolog
 
 	startTime := time.Now()
 
-	// Get latencies
-	weights := makeEthereumLikeLatencyMatrix(t, n, seed)
+	// Get latencies and node IDs
+	weights, nodeIDs := makeEthereumLikeLatencyMatrix(t, n, seed)
 
 	// Map IP addresses to node idx
 	idxByIP := make(map[string]int, n)
@@ -457,6 +442,7 @@ func makeEthereumLikeTopology(t *testing.T, n int, seed int64) experimentTopolog
 	return experimentTopology{
 		hosts:   hosts,
 		weights: weights,
+		nodeIDs: nodeIDs,
 		closeFn: func() {
 			network.Close()
 			for _, h := range meta.Nodes {
@@ -466,7 +452,7 @@ func makeEthereumLikeTopology(t *testing.T, n int, seed int64) experimentTopolog
 	}
 }
 
-func makeEthereumLikeLatencyMatrix(t *testing.T, n int, seed int64) [][]time.Duration {
+func makeEthereumLikeLatencyMatrix(t *testing.T, n int, seed int64) ([][]time.Duration, []int) {
 	t.Helper()
 
 	type nodeEntry struct {
@@ -508,8 +494,10 @@ func makeEthereumLikeLatencyMatrix(t *testing.T, n int, seed int64) [][]time.Dur
 	})
 	selected := indices[:n]
 
+	nodeIDs := make([]int, n)
 	idToIdx := make(map[int]int, n)
 	for i, idx := range selected {
+		nodeIDs[i] = allNodes[idx].ID
 		idToIdx[allNodes[idx].ID] = i
 	}
 
@@ -562,106 +550,22 @@ func makeEthereumLikeLatencyMatrix(t *testing.T, n int, seed int64) [][]time.Dur
 		}
 	}
 
-	return weights
+	return weights, nodeIDs
 }
 
-func logWindowStats(t *testing.T, name string, res experimentResult, windowSize int) {
-	windows := make([]int, 0, len(res.windowLatencyMS))
-	for w := range res.windowLatencyMS {
-		windows = append(windows, w)
-	}
-	sort.Ints(windows)
-	for _, w := range windows {
-		lats := res.windowLatencyMS[w]
-		st := res.windowStretch[w]
-		latStats := computeMetricStats(lats)
-		stStats := computeMetricStats(st)
-		t.Logf("%s window=%d trials=%d..%d latency[min=%.2f mean=%.2f max=%.2f p50=%.2f p95=%.2f p99=%.2f std=%.2f]ms stretch[min=%.3f mean=%.3f max=%.3f p50=%.3f p95=%.3f p99=%.3f std=%.3f]",
-			name, w, w*windowSize, (w+1)*windowSize-1,
-			latStats.Min, latStats.Mean, latStats.Max, latStats.P50, latStats.P95, latStats.P99, latStats.StdDev,
-			stStats.Min, stStats.Mean, stStats.Max, stStats.P50, stStats.P95, stStats.P99, stStats.StdDev,
-		)
-	}
-}
-
-func logScenarioStats(t *testing.T, prefix string, s spreadScenarioSummary) {
-	t.Logf("%s: latency[min=%.2f mean=%.2f max=%.2f p50=%.2f p95=%.2f p99=%.2f std=%.2f]ms stretch[min=%.3f mean=%.3f max=%.3f p50=%.3f p95=%.3f p99=%.3f std=%.3f]",
-		prefix,
-		s.Latency.Min, s.Latency.Mean, s.Latency.Max, s.Latency.P50, s.Latency.P95, s.Latency.P99, s.Latency.StdDev,
-		s.Stretch.Min, s.Stretch.Mean, s.Stretch.Max, s.Stretch.P50, s.Stretch.P95, s.Stretch.P99, s.Stretch.StdDev,
-	)
-}
-
-func buildSpreadExperimentExport(gsRes, spreadRes experimentResult, nodeCount, trials, windowSize, seed int) spreadExperimentExport {
+func buildSpreadExperimentExport(gsRes, spreadRes experimentResult, nodeIDs []int, nodeCount, trials, seed int) spreadExperimentExport {
 	return spreadExperimentExport{
 		GeneratedAt:       time.Now().UTC().Format(time.RFC3339Nano),
 		Nodes:             nodeCount,
 		Trials:            trials,
-		WindowSize:        windowSize,
 		Seed:              seed,
 		WarmupEvery:       envInt("SPREAD_SIMNET_WARMUP_EVERY", SPREAD_SIMNET_WARMUP_EVERY),
 		WarmupPerPublish:  envInt("SPREAD_SIMNET_WARMUP_ROUNDS_PER_PUBLISH", SPREAD_SIMNET_WARMUP_ROUNDS_PER_PUBLISH),
 		LinkMiBps:         envInt("SPREAD_SIMNET_LINK_MIBPS", SPREAD_SIMNET_LINK_MIBPS),
 		ScenarioTimeoutMs: int(SPREAD_SIMNET_SCENARIO_TIMEOUT / time.Millisecond),
-		Gossipsub:         summarizeScenario("gossipsub", gsRes, windowSize),
-		Spread:            summarizeScenario("spread", spreadRes, windowSize),
-	}
-}
-
-func summarizeScenario(name string, res experimentResult, windowSize int) spreadScenarioSummary {
-	out := spreadScenarioSummary{
-		Name:    name,
-		Latency: computeMetricStats(res.latencyMS),
-		Stretch: computeMetricStats(res.stretch),
-	}
-
-	windows := make([]int, 0, len(res.windowLatencyMS))
-	for w := range res.windowLatencyMS {
-		windows = append(windows, w)
-	}
-	sort.Ints(windows)
-	out.Windows = make([]spreadWindowSummary, 0, len(windows))
-	for _, w := range windows {
-		lats := res.windowLatencyMS[w]
-		st := res.windowStretch[w]
-		out.Windows = append(out.Windows, spreadWindowSummary{
-			Window:     w,
-			TrialStart: w * windowSize,
-			TrialEnd:   (w+1)*windowSize - 1,
-			Latency:    computeMetricStats(lats),
-			Stretch:    computeMetricStats(st),
-		})
-	}
-	return out
-}
-
-func computeMetricStats(xs []float64) metricStats {
-	if len(xs) == 0 {
-		return metricStats{}
-	}
-	sorted := append([]float64(nil), xs...)
-	sort.Float64s(sorted)
-
-	sum := 0.0
-	for _, x := range sorted {
-		sum += x
-	}
-	mean := sum / float64(len(sorted))
-
-	varianceSum := 0.0
-	for _, x := range sorted {
-		d := x - mean
-		varianceSum += d * d
-	}
-
-	return metricStats{
-		Min:    sorted[0],
-		Mean:   mean,
-		Max:    sorted[len(sorted)-1],
-		P50:    quantileSorted(sorted, 0.50),
-		P95:    quantileSorted(sorted, 0.95),
-		P99:    quantileSorted(sorted, 0.99),
-		StdDev: math.Sqrt(varianceSum / float64(len(sorted))),
+		NodeIDs:           nodeIDs,
+		Gossipsub:         gsRes.trials,
+		Spread:            spreadRes.trials,
 	}
 }
 
@@ -680,12 +584,12 @@ func writeSpreadExperimentExport(path string, doc spreadExperimentExport) error 
 	return writeAtomicFile(path, b, 0o644)
 }
 
-func maybeWriteSpreadExperimentExport(gsRes, spreadRes experimentResult, nodeCount, trials, windowSize, seed int) (string, error) {
+func maybeWriteSpreadExperimentExport(gsRes, spreadRes experimentResult, nodeIDs []int, nodeCount, trials, seed int) (string, error) {
 	exportPath := os.Getenv(SPREAD_SIMNET_EXPORT_PATH_ENV)
 	if exportPath == "" {
 		return "", nil
 	}
-	doc := buildSpreadExperimentExport(gsRes, spreadRes, nodeCount, trials, windowSize, seed)
+	doc := buildSpreadExperimentExport(gsRes, spreadRes, nodeIDs, nodeCount, trials, seed)
 	doc.RunID = os.Getenv(SPREAD_SIMNET_RUN_ID_ENV)
 	doc.GitCommit = os.Getenv(SPREAD_SIMNET_GIT_COMMIT_ENV)
 	return exportPath, writeSpreadExperimentExport(exportPath, doc)
@@ -729,26 +633,6 @@ func writeAtomicFile(path string, data []byte, perm os.FileMode) error {
 		return fmt.Errorf("close parent dir %q: %w", dir, err)
 	}
 	return nil
-}
-
-func quantileSorted(sorted []float64, p float64) float64 {
-	if len(sorted) == 0 {
-		return 0
-	}
-	if p <= 0 {
-		return sorted[0]
-	}
-	if p >= 1 {
-		return sorted[len(sorted)-1]
-	}
-	idx := int(math.Ceil(p*float64(len(sorted)))) - 1
-	if idx < 0 {
-		idx = 0
-	}
-	if idx >= len(sorted) {
-		idx = len(sorted) - 1
-	}
-	return sorted[idx]
 }
 
 func spreadClusteringConfigFromEnv() *SpreadClusteringConfig {
@@ -820,11 +704,4 @@ func envBool(key string, def bool) bool {
 		return def
 	}
 	return v
-}
-
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
 }

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -25,7 +24,6 @@ const (
 	defaultConfigPath          = "simnet_spread_tests/config.yaml"
 	checkpointFilename         = "checkpoint.json"
 	resultsFilename            = "results.jsonl"
-	summaryFilename            = "summary.json"
 	runsDirname                = "runs"
 	logsDirname                = "logs"
 	spreadExportPathEnv        = "SPREAD_SIMNET_EXPORT_PATH"
@@ -33,7 +31,6 @@ const (
 	spreadGitCommitEnv         = "SPREAD_SIMNET_GIT_COMMIT"
 	spreadNodesEnv             = "SPREAD_SIMNET_NODES"
 	spreadTrialsEnv            = "SPREAD_SIMNET_TRIALS"
-	spreadWindowSizeEnv        = "SPREAD_SIMNET_WINDOW_SIZE"
 	spreadSeedEnv              = "SPREAD_SIMNET_SEED"
 	spreadWarmupEveryEnv       = "SPREAD_SIMNET_WARMUP_EVERY"
 	spreadWarmupRoundsEnv      = "SPREAD_SIMNET_WARMUP_ROUNDS_PER_PUBLISH"
@@ -69,30 +66,9 @@ func (s *stringListFlag) Set(v string) error {
 	return nil
 }
 
-type metricStats struct {
-	Min    float64 `json:"min"`
-	Mean   float64 `json:"mean"`
-	Max    float64 `json:"max"`
-	P50    float64 `json:"p50"`
-	P95    float64 `json:"p95"`
-	P99    float64 `json:"p99"`
-	StdDev float64 `json:"stddev"`
-}
-
-type scenarioMetrics struct {
-	Latency metricStats `json:"latency"`
-	Stretch metricStats `json:"stretch"`
-}
-
-type runMetrics struct {
-	Gossipsub scenarioMetrics `json:"gossipsub"`
-	Spread    scenarioMetrics `json:"spread"`
-}
-
 type runConfig struct {
 	Nodes             int     `json:"nodes"`
 	Trials            int     `json:"trials"`
-	WindowSize        int     `json:"window_size"`
 	Seed              int     `json:"seed"`
 	WarmupEvery       int     `json:"warmup_every"`
 	WarmupPerPublish  int     `json:"warmup_rounds_per_publish"`
@@ -121,36 +97,28 @@ type runConfig struct {
 }
 
 type runExport struct {
-	RunID             string          `json:"run_id"`
-	GitCommit         string          `json:"git_commit"`
-	GeneratedAt       string          `json:"generated_at"`
-	Nodes             int             `json:"nodes"`
-	Trials            int             `json:"trials"`
-	WindowSize        int             `json:"window_size"`
-	Seed              int             `json:"seed"`
-	WarmupEvery       int             `json:"warmup_every"`
-	WarmupPerPublish  int             `json:"warmup_rounds_per_publish"`
-	LinkMiBps         int             `json:"link_mibps"`
-	ScenarioTimeoutMs int             `json:"scenario_timeout_ms"`
-	Gossipsub         scenarioMetrics `json:"gossipsub"`
-	Spread            scenarioMetrics `json:"spread"`
+	RunID       string `json:"run_id"`
+	GitCommit   string `json:"git_commit"`
+	GeneratedAt string `json:"generated_at"`
+	Nodes       int    `json:"nodes"`
+	Trials      int    `json:"trials"`
+	Seed        int    `json:"seed"`
 }
 
 type attemptRecord struct {
-	RunID      int         `json:"run_id"`
-	Attempt    int         `json:"attempt"`
-	RetryCount int         `json:"retry_count"`
-	Status     string      `json:"status"`
-	StartTime  string      `json:"start_time"`
-	EndTime    string      `json:"end_time"`
-	DurationMS int64       `json:"duration_ms"`
-	ExitCode   *int        `json:"exit_code,omitempty"`
-	Error      string      `json:"error,omitempty"`
-	ExportPath string      `json:"export_path"`
-	LogPath    string      `json:"log_path"`
-	GitCommit  string      `json:"git_commit,omitempty"`
-	Config     runConfig   `json:"config"`
-	Metrics    *runMetrics `json:"metrics,omitempty"`
+	RunID      int       `json:"run_id"`
+	Attempt    int       `json:"attempt"`
+	RetryCount int       `json:"retry_count"`
+	Status     string    `json:"status"`
+	StartTime  string    `json:"start_time"`
+	EndTime    string    `json:"end_time"`
+	DurationMS int64     `json:"duration_ms"`
+	ExitCode   *int      `json:"exit_code,omitempty"`
+	Error      string    `json:"error,omitempty"`
+	ExportPath string    `json:"export_path"`
+	LogPath    string    `json:"log_path"`
+	GitCommit  string    `json:"git_commit,omitempty"`
+	Config     runConfig `json:"config"`
 }
 
 type checkpoint struct {
@@ -162,28 +130,6 @@ type checkpoint struct {
 	TimeoutRuns  int    `json:"timeout_runs"`
 	Attempts     int    `json:"attempts_total"`
 	UpdatedAtUTC string `json:"updated_at"`
-}
-
-type metricAggregate struct {
-	Count int     `json:"count"`
-	Mean  float64 `json:"mean"`
-	P50   float64 `json:"p50"`
-	P95   float64 `json:"p95"`
-	Min   float64 `json:"min"`
-	Max   float64 `json:"max"`
-}
-
-type summary struct {
-	GeneratedAtUTC string                     `json:"generated_at"`
-	RunsTarget     int                        `json:"runs_target"`
-	FinalRunCount  int                        `json:"final_run_count"`
-	SuccessRuns    int                        `json:"success_runs"`
-	FailedRuns     int                        `json:"failed_runs"`
-	TimeoutRuns    int                        `json:"timeout_runs"`
-	AttemptsTotal  int                        `json:"attempts_total"`
-	FailedRunIDs   []int                      `json:"failed_run_ids"`
-	Aggregates     map[string]metricAggregate `json:"aggregates"`
-	IgnoredLines   int                        `json:"ignored_lines"`
 }
 
 type batchOptions struct {
@@ -212,7 +158,6 @@ type batchConfigYAML struct {
 type simnetConfigYAML struct {
 	Nodes                  *int `yaml:"spread_simnet_nodes"`
 	Trials                 *int `yaml:"spread_simnet_trials"`
-	WindowSize             *int `yaml:"spread_simnet_window_size"`
 	Seed                   *int `yaml:"spread_simnet_seed"`
 	WarmupEvery            *int `yaml:"spread_simnet_warmup_every"`
 	WarmupRoundsPerPublish *int `yaml:"spread_simnet_warmup_rounds_per_publish"`
@@ -247,7 +192,6 @@ type executionOutcome struct {
 	Status   string
 	ExitCode *int
 	ErrText  string
-	Metrics  *runMetrics
 }
 
 type runExecutor func(ctx context.Context, runID, attempt int, runIDLabel, exportPath, logPath, gitCommit string, cfg runConfig, env map[string]string) executionOutcome
@@ -324,10 +268,9 @@ func runBatch(opts batchOptions, baseEnv map[string]string, baseCfg runConfig, e
 
 	checkpointPath := filepath.Join(opts.OutDir, checkpointFilename)
 	resultsPath := filepath.Join(opts.OutDir, resultsFilename)
-	summaryPath := filepath.Join(opts.OutDir, summaryFilename)
 
 	if !opts.Resume {
-		if err := resetOutputDir(opts.OutDir, runsDir, logsDir, resultsPath, checkpointPath, summaryPath); err != nil {
+		if err := resetOutputDir(opts.OutDir, runsDir, logsDir, resultsPath, checkpointPath); err != nil {
 			return err
 		}
 	}
@@ -371,7 +314,6 @@ func runBatch(opts batchOptions, baseEnv map[string]string, baseCfg runConfig, e
 				LogPath:    logPath,
 				GitCommit:  gitCommit,
 				Config:     baseCfg,
-				Metrics:    outcome.Metrics,
 			}
 			if err := appendJSONLine(resultsPath, rec); err != nil {
 				return err
@@ -408,14 +350,6 @@ func runBatch(opts batchOptions, baseEnv map[string]string, baseCfg runConfig, e
 		}
 	}
 
-	records, ignored, err := loadAttemptRecords(resultsPath)
-	if err != nil {
-		return err
-	}
-	s := buildSummary(opts.Runs, records, ignored)
-	if err := writeJSONAtomic(summaryPath, s); err != nil {
-		return err
-	}
 	return nil
 }
 
@@ -449,12 +383,8 @@ func executeGoTestRun(ctx context.Context, runID, attempt int, runIDLabel, expor
 	if readErr != nil {
 		return executionOutcome{Status: "fail", ErrText: readErr.Error()}
 	}
-
-	metrics := &runMetrics{
-		Gossipsub: exported.Gossipsub,
-		Spread:    exported.Spread,
-	}
-	return executionOutcome{Status: "success", Metrics: metrics}
+	_ = exported // validation only: file exists and is valid JSON
+	return executionOutcome{Status: "success"}
 }
 
 func shortErr(cmdErr error, output []byte) string {
@@ -537,7 +467,6 @@ func defaultFileConfig() fileConfig {
 
 	nodes := 20
 	trials := 500
-	windowSize := 10
 	seed := 1337
 	warmupEvery := 0
 	warmupRounds := 1
@@ -576,7 +505,6 @@ func defaultFileConfig() fileConfig {
 		Simnet: simnetConfigYAML{
 			Nodes:                  &nodes,
 			Trials:                 &trials,
-			WindowSize:             &windowSize,
 			Seed:                   &seed,
 			WarmupEvery:            &warmupEvery,
 			WarmupRoundsPerPublish: &warmupRounds,
@@ -625,7 +553,6 @@ func validateConfig(cfg fileConfig) error {
 
 	require(cfg.Simnet.Nodes != nil, "simnet.spread_simnet_nodes")
 	require(cfg.Simnet.Trials != nil, "simnet.spread_simnet_trials")
-	require(cfg.Simnet.WindowSize != nil, "simnet.spread_simnet_window_size")
 	require(cfg.Simnet.Seed != nil, "simnet.spread_simnet_seed")
 	require(cfg.Simnet.WarmupEvery != nil, "simnet.spread_simnet_warmup_every")
 	require(cfg.Simnet.WarmupRoundsPerPublish != nil, "simnet.spread_simnet_warmup_rounds_per_publish")
@@ -666,7 +593,6 @@ func configToEnvMap(cfg fileConfig) map[string]string {
 	return map[string]string{
 		spreadNodesEnv:             strconv.Itoa(*cfg.Simnet.Nodes),
 		spreadTrialsEnv:            strconv.Itoa(*cfg.Simnet.Trials),
-		spreadWindowSizeEnv:        strconv.Itoa(*cfg.Simnet.WindowSize),
 		spreadSeedEnv:              strconv.Itoa(*cfg.Simnet.Seed),
 		spreadWarmupEveryEnv:       strconv.Itoa(*cfg.Simnet.WarmupEvery),
 		spreadWarmupRoundsEnv:      strconv.Itoa(*cfg.Simnet.WarmupRoundsPerPublish),
@@ -699,7 +625,6 @@ func configFromEnv(env map[string]string) runConfig {
 	cfg := runConfig{}
 	cfg.Nodes = envIntFromMap(env, spreadNodesEnv)
 	cfg.Trials = envIntFromMap(env, spreadTrialsEnv)
-	cfg.WindowSize = envIntFromMap(env, spreadWindowSizeEnv)
 	cfg.Seed = envIntFromMap(env, spreadSeedEnv)
 	cfg.WarmupEvery = envIntFromMap(env, spreadWarmupEveryEnv)
 	cfg.WarmupPerPublish = envIntFromMap(env, spreadWarmupRoundsEnv)
@@ -803,144 +728,6 @@ func appendJSONLine(path string, v any) error {
 	return nil
 }
 
-func loadAttemptRecords(path string) ([]attemptRecord, int, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, 0, nil
-		}
-		return nil, 0, fmt.Errorf("open results jsonl: %w", err)
-	}
-	defer f.Close()
-
-	s := bufio.NewScanner(f)
-	s.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
-	records := make([]attemptRecord, 0)
-	ignored := 0
-	for s.Scan() {
-		line := strings.TrimSpace(s.Text())
-		if line == "" {
-			continue
-		}
-		var rec attemptRecord
-		if err := json.Unmarshal([]byte(line), &rec); err != nil {
-			ignored++
-			continue
-		}
-		records = append(records, rec)
-	}
-	if err := s.Err(); err != nil {
-		return nil, ignored, fmt.Errorf("scan results jsonl: %w", err)
-	}
-	return records, ignored, nil
-}
-
-func buildSummary(runsTarget int, records []attemptRecord, ignored int) summary {
-	s := summary{
-		GeneratedAtUTC: time.Now().UTC().Format(time.RFC3339Nano),
-		RunsTarget:     runsTarget,
-		AttemptsTotal:  len(records),
-		Aggregates:     make(map[string]metricAggregate),
-		IgnoredLines:   ignored,
-	}
-	lastByRun := make(map[int]attemptRecord)
-	for _, r := range records {
-		cur, ok := lastByRun[r.RunID]
-		if !ok || r.Attempt >= cur.Attempt {
-			lastByRun[r.RunID] = r
-		}
-	}
-	failedIDs := make([]int, 0)
-	metricData := make(map[string][]float64)
-
-	runIDs := make([]int, 0, len(lastByRun))
-	for runID := range lastByRun {
-		runIDs = append(runIDs, runID)
-	}
-	sort.Ints(runIDs)
-
-	for _, runID := range runIDs {
-		r := lastByRun[runID]
-		s.FinalRunCount++
-		switch r.Status {
-		case "success":
-			s.SuccessRuns++
-			if r.Metrics != nil {
-				appendScenarioMetricStats(metricData, "gossipsub", r.Metrics.Gossipsub)
-				appendScenarioMetricStats(metricData, "spread", r.Metrics.Spread)
-			}
-		case "timeout":
-			s.TimeoutRuns++
-			failedIDs = append(failedIDs, runID)
-		default:
-			s.FailedRuns++
-			failedIDs = append(failedIDs, runID)
-		}
-	}
-	s.FailedRunIDs = failedIDs
-
-	for name, xs := range metricData {
-		if len(xs) == 0 {
-			continue
-		}
-		s.Aggregates[name] = aggregate(xs)
-	}
-
-	return s
-}
-
-func appendScenarioMetricStats(out map[string][]float64, prefix string, metrics scenarioMetrics) {
-	appendMetricStats(out, prefix+".latency", metrics.Latency)
-	appendMetricStats(out, prefix+".stretch", metrics.Stretch)
-}
-
-func appendMetricStats(out map[string][]float64, prefix string, stats metricStats) {
-	out[prefix+".min"] = append(out[prefix+".min"], stats.Min)
-	out[prefix+".mean"] = append(out[prefix+".mean"], stats.Mean)
-	out[prefix+".max"] = append(out[prefix+".max"], stats.Max)
-	out[prefix+".p50"] = append(out[prefix+".p50"], stats.P50)
-	out[prefix+".p95"] = append(out[prefix+".p95"], stats.P95)
-	out[prefix+".p99"] = append(out[prefix+".p99"], stats.P99)
-	out[prefix+".stddev"] = append(out[prefix+".stddev"], stats.StdDev)
-}
-
-func aggregate(xs []float64) metricAggregate {
-	cpy := append([]float64(nil), xs...)
-	sort.Float64s(cpy)
-	sum := 0.0
-	for _, x := range cpy {
-		sum += x
-	}
-	return metricAggregate{
-		Count: len(cpy),
-		Mean:  sum / float64(len(cpy)),
-		P50:   quantile(cpy, 0.50),
-		P95:   quantile(cpy, 0.95),
-		Min:   cpy[0],
-		Max:   cpy[len(cpy)-1],
-	}
-}
-
-func quantile(sorted []float64, p float64) float64 {
-	if len(sorted) == 0 {
-		return 0
-	}
-	if p <= 0 {
-		return sorted[0]
-	}
-	if p >= 1 {
-		return sorted[len(sorted)-1]
-	}
-	idx := int(float64(len(sorted)-1) * p)
-	if idx < 0 {
-		idx = 0
-	}
-	if idx >= len(sorted) {
-		idx = len(sorted) - 1
-	}
-	return sorted[idx]
-}
-
 func loadCheckpoint(path string) (checkpoint, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -1024,7 +811,7 @@ func currentGitCommit() string {
 	return strings.TrimSpace(string(out))
 }
 
-func resetOutputDir(outDir, runsDir, logsDir, resultsPath, checkpointPath, summaryPath string) error {
+func resetOutputDir(outDir, runsDir, logsDir, resultsPath, checkpointPath string) error {
 	if err := os.RemoveAll(runsDir); err != nil {
 		return fmt.Errorf("reset runs dir: %w", err)
 	}
@@ -1042,9 +829,6 @@ func resetOutputDir(outDir, runsDir, logsDir, resultsPath, checkpointPath, summa
 	}
 	if err := os.Remove(checkpointPath); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("reset checkpoint: %w", err)
-	}
-	if err := os.Remove(summaryPath); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("reset summary: %w", err)
 	}
 	if err := os.WriteFile(filepath.Join(outDir, ".keep"), []byte{}, 0o644); err != nil {
 		return fmt.Errorf("ensure out-dir writable: %w", err)

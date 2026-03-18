@@ -50,14 +50,28 @@ Structure:
 outputs/
   checkpoint.json        # resume/progress state
   results.jsonl          # append-only attempt log
-  summary.json           # aggregate summary rebuilt from results.jsonl
   runs/
-    run-000000.json      # per-run exported metrics (on success)
+    run-000000.json      # per-run raw data export (on success)
   logs/
     run-000000-attempt-00.log
   plots/
     *.png
-    summary.txt
+```
+
+Each `run-NNNNNN.json` contains the raw per-pair, per-trial observations:
+
+```json
+{
+  "nodes": 30,
+  "seed": 1337,
+  "node_ids": [3, 31, ...],
+  "gossipsub": [
+    {"trial": 0, "src": 31, "deliveries": [
+      {"dst": 3, "latency_ms": 53.9, "stretch": 1.15}, ...
+    ]}, ...
+  ],
+  "spread": [ ... ]
+}
 ```
 
 Notes:
@@ -77,5 +91,20 @@ Optional flags:
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--results PATH` | `simnet_spread_tests/outputs/results.jsonl` | Path to results file |
+| `--runs-dir PATH` | `simnet_spread_tests/outputs/runs` | Directory with per-run JSON exports |
+| `--results PATH` | `simnet_spread_tests/outputs/results.jsonl` | Path to results.jsonl for finding successful runs |
 | `--out DIR` | `simnet_spread_tests/outputs/plots` | Output directory for PNGs |
+| `--group-by {n_seed,n}` | `n_seed` | Grouping for per-pair/per-topology stats |
+
+Generated charts:
+
+| File | Description |
+|------|-------------|
+| `01_per_pair_scatter_by_n.png` | Per-pair GossipSub vs Spread scatter, colored by N |
+| `02_per_pair_scatter_by_seed.png` | Per-pair scatter, colored by seed (n_seed grouping only) |
+| `03_per_topology_scatter_by_n.png` | Per-topology scatter, colored by N |
+| `04_cdf_per_pair.png` | CDF of per-pair mean latency & stretch |
+| `05_cdf_per_topology.png` | CDF of per-topology mean latency & stretch |
+| `06_cdf_raw.png` | CDF of all raw observations |
+| `07_improvement_heatmap.png` | % improvement heatmap (Spread vs GossipSub) |
+| `08_distributions.png` | Latency & stretch histograms + delta distributions |

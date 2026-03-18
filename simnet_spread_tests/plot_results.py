@@ -1,39 +1,38 @@
 #!/usr/bin/env python3
 """
-Plot results from simnet spread experiments.
+Plot results from simnet spread experiments (raw per-pair data).
 
 Usage (from repo root):
-    python simnet_spread_tests/plot_results.py [--results PATH] [--out DIR]
+    python simnet_spread_tests/plot_results.py [--runs-dir PATH] [--results PATH] [--out DIR] [--group-by {n_seed,n}]
 
 Requirements:
-    pip install matplotlib seaborn numpy
+    pip install matplotlib seaborn numpy pandas
 """
 
 import argparse
 import json
 import os
 import sys
-from collections import defaultdict
+from pathlib import Path
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import seaborn as sns
 
-# ── Style ─────────────────────────────────────────────────────────────────────
+# -- Style ------------------------------------------------------------------
 sns.set_theme(style="whitegrid", palette="Set2")
 PROTOCOL_COLORS = {"gossipsub": "#e07b54", "spread": "#5b8db8"}
 PROTOCOL_LABELS = {"gossipsub": "GossipSub", "spread": "Spread"}
 MARKERS = {"gossipsub": "o", "spread": "s"}
 
-# Categorical palette + distinct markers for per-N scatter plots
 _N_PALETTE = sns.color_palette("tab10")
-_N_MARKERS  = ["o", "X", "s", "P", "^", "D", "v", "*"]
+_N_MARKERS = ["o", "X", "s", "P", "^", "D", "v", "*"]
 
 
-def n_styles(ns: list) -> dict:
-    """Return {n: (color, marker)} for each unique N value, sorted ascending."""
+def n_styles(ns):
     unique = sorted(set(ns))
     return {
         n: (_N_PALETTE[i % len(_N_PALETTE)], _N_MARKERS[i % len(_N_MARKERS)])
@@ -41,48 +40,130 @@ def n_styles(ns: list) -> dict:
     }
 
 
-# ── Data loading ──────────────────────────────────────────────────────────────
+# -- Data loading -----------------------------------------------------------
 
-def load_results(path: str) -> list:
-    """Load successful runs from results.jsonl, keeping last attempt per run_id."""
-    by_run: dict = {}
-    with open(path) as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            rec = json.loads(line)
-            if rec.get("status") != "success":
-                continue
-            rid = rec["run_id"]
-            if rid not in by_run or rec["attempt"] > by_run[rid]["attempt"]:
-                by_run[rid] = rec
-    return list(by_run.values())
+def load_run_exports(runs_dir: str, results_path: str) -> list:
+    """
+    Load per-run JSON export files.  Use the results.jsonl to find which runs
+    succeeded and their export paths, then read the export JSON for each.
+    """
+    exports = []
+
+    # First try reading results.jsonl to find successful runs
+    if results_path and os.path.isfile(results_path):
+        by_run = {}
+        with open(results_path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                rec = json.loads(line)
+                if rec.get("status") != "success":
+                    continue
+                rid = rec["run_id"]
+                if rid not in by_run or rec["attempt"] > by_run[rid]["attempt"]:
+                    by_run[rid] = rec
+        for rid in sorted(by_run.keys()):
+            epath = by_run[rid].get("export_path", "")
+            if epath and os.path.isfile(epath):
+                with open(epath) as f:
+                    exports.append(json.load(f))
+        if exports:
+            return exports
+
+    # Fallback: scan runs/ directory directly
+    runs_path = Path(runs_dir)
+    if not runs_path.is_dir():
+        return exports
+    for p in sorted(runs_path.glob("*.json")):
+        with open(p) as f:
+            exports.append(json.load(f))
+    return exports
 
 
-def extract_rows(records: list) -> list:
-    """Flatten each record into a flat dict of all stats."""
+def flatten_observations(exports: list) -> pd.DataFrame:
+    """
+    Flatten nested JSON exports into a single DataFrame with columns:
+        run_idx, n, seed, protocol, trial, src, dst, latency_ms, stretch
+    """
     rows = []
-    for r in records:
-        cfg = r["config"]
-        m = r["metrics"]
-        row = {"run_id": r["run_id"], "nodes": cfg["nodes"]}
+    for run_idx, exp in enumerate(exports):
+        n = exp["nodes"]
+        seed = exp["seed"]
         for proto in ("gossipsub", "spread"):
-            for stat in ("latency", "stretch"):
-                for q in ("min", "mean", "max", "p50", "p95", "p99", "stddev"):
-                    row[f"{proto}_{stat}_{q}"] = m[proto][stat][q]
-        rows.append(row)
-    return rows
+            for tr in exp.get(proto, []):
+                trial = tr["trial"]
+                src = tr["src"]
+                for d in tr["deliveries"]:
+                    rows.append({
+                        "run_idx": run_idx,
+                        "n": n,
+                        "seed": seed,
+                        "protocol": proto,
+                        "trial": trial,
+                        "src": src,
+                        "dst": d["dst"],
+                        "latency_ms": d["latency_ms"],
+                        "stretch": d["stretch"],
+                    })
+    return pd.DataFrame(rows)
 
 
-def grouped_by_n(rows: list) -> dict:
-    g: dict = defaultdict(list)
-    for r in rows:
-        g[r["nodes"]].append(r)
-    return dict(sorted(g.items()))
+def build_per_pair_stats(df: pd.DataFrame, group_by: str) -> pd.DataFrame:
+    """
+    Compute per-pair statistics.
+    group_by = 'n_seed': group by (n, seed, protocol, src, dst)
+    group_by = 'n':      group by (n, protocol, src, dst)
+    """
+    if group_by == "n_seed":
+        grp_cols = ["n", "seed", "protocol", "src", "dst"]
+    else:
+        grp_cols = ["n", "protocol", "src", "dst"]
+
+    agg = df.groupby(grp_cols, as_index=False).agg(
+        latency_mean=("latency_ms", "mean"),
+        latency_p50=("latency_ms", "median"),
+        latency_p95=("latency_ms", lambda x: np.percentile(x, 95)),
+        latency_p99=("latency_ms", lambda x: np.percentile(x, 99)),
+        latency_std=("latency_ms", "std"),
+        stretch_mean=("stretch", "mean"),
+        stretch_p50=("stretch", "median"),
+        stretch_p95=("stretch", lambda x: np.percentile(x, 95)),
+        stretch_p99=("stretch", lambda x: np.percentile(x, 99)),
+        stretch_std=("stretch", "std"),
+        count=("latency_ms", "count"),
+    )
+    return agg
 
 
-# ── I/O helper ────────────────────────────────────────────────────────────────
+def build_per_topology_stats(df: pd.DataFrame, group_by: str) -> pd.DataFrame:
+    """
+    Compute per-topology (per-run) statistics.
+    group_by = 'n_seed': group by (n, seed, protocol)
+    group_by = 'n':      group by (n, protocol)
+    """
+    if group_by == "n_seed":
+        grp_cols = ["n", "seed", "protocol"]
+    else:
+        grp_cols = ["n", "protocol"]
+
+    agg = df.groupby(grp_cols, as_index=False).agg(
+        latency_mean=("latency_ms", "mean"),
+        latency_p50=("latency_ms", "median"),
+        latency_p95=("latency_ms", lambda x: np.percentile(x, 95)),
+        latency_p99=("latency_ms", lambda x: np.percentile(x, 99)),
+        latency_std=("latency_ms", "std"),
+        stretch_mean=("stretch", "mean"),
+        stretch_p50=("stretch", "median"),
+        stretch_p95=("stretch", lambda x: np.percentile(x, 95)),
+        stretch_p99=("stretch", lambda x: np.percentile(x, 99)),
+        stretch_std=("stretch", "std"),
+        count=("latency_ms", "count"),
+    )
+    return agg
+
+
+# -- I/O helper -------------------------------------------------------------
 
 def savefig(fig, out_dir: str, name: str):
     path = os.path.join(out_dir, name)
@@ -91,265 +172,266 @@ def savefig(fig, out_dir: str, name: str):
     print(f"  saved {path}")
 
 
-# ── Reusable plot primitives ──────────────────────────────────────────────────
+# -- Scatter helpers --------------------------------------------------------
 
-def plot_metric_vs_n(ax, groups: dict, key: str, ylabel: str, title: str):
-    """Line chart with per-run dots and mean±std across replicated runs."""
-    ns = sorted(groups.keys())
-    for proto in ("gossipsub", "spread"):
-        col = f"{proto}_{key}"
-        means, stds, ns_plot = [], [], []
-        for n in ns:
-            vals = [r[col] for r in groups[n]]
-            means.append(np.mean(vals))
-            stds.append(np.std(vals))
-            ns_plot.append(n)
-            for v in vals:
-                ax.scatter(n, v, color=PROTOCOL_COLORS[proto],
-                           alpha=0.35, s=25, zorder=3)
-        ax.errorbar(ns_plot, means, yerr=stds,
-                    label=PROTOCOL_LABELS[proto],
-                    color=PROTOCOL_COLORS[proto],
-                    marker=MARKERS[proto], linewidth=2, markersize=7,
-                    capsize=4, zorder=4)
-    ax.set_xlabel("Nodes (N)")
-    ax.set_ylabel(ylabel)
-    ax.set_title(title)
-    ax.legend()
-    ax.set_xticks(ns)
+def _scatter_gs_vs_spread(ax, gs_vals, sp_vals, colors, markers, labels, title, xlabel, ylabel):
+    """Draw GossipSub (X) vs Spread (Y) scatter with x=y line."""
+    lo = min(min(gs_vals), min(sp_vals)) * 0.95
+    hi = max(max(gs_vals), max(sp_vals)) * 1.05
+    ax.plot([lo, hi], [lo, hi], "k--", linewidth=1.5, alpha=0.65, label="X = Y", zorder=1)
 
-
-def _scatter_one(ax, rows: list, key: str, title: str, xlabel: str, ylabel: str):
-    """
-    Scatter on a given axes: X = GossipSub value, Y = Spread value.
-    One point per run. Each N gets a unique color + marker.
-    Dashed x=y diagonal drawn for reference.
-    """
-    styles = n_styles([r["nodes"] for r in rows])
-    gvals = [r[f"gossipsub_{key}"] for r in rows]
-    svals = [r[f"spread_{key}"] for r in rows]
-
-    lo = min(min(gvals), min(svals)) * 0.95
-    hi = max(max(gvals), max(svals)) * 1.05
-    ax.plot([lo, hi], [lo, hi], "k--", linewidth=1.5, alpha=0.65,
-            label="X = Y", zorder=1)
-
-    seen_n: set = set()
-    for r, g, s in zip(rows, gvals, svals):
-        n = r["nodes"]
-        color, marker = styles[n]
-        lbl = str(n) if n not in seen_n else None
-        seen_n.add(n)
-        ax.scatter(g, s, color=color, marker=marker, s=80, zorder=3,
-                   label=lbl, edgecolors="white", linewidths=0.5)
+    seen = set()
+    for g, s, c, m, lbl in zip(gs_vals, sp_vals, colors, markers, labels):
+        show_lbl = lbl if lbl not in seen else None
+        seen.add(lbl)
+        ax.scatter(g, s, color=c, marker=m, s=50, zorder=3,
+                   label=show_lbl, edgecolors="white", linewidths=0.4, alpha=0.7)
 
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
     ax.set_title(title)
-    ax.legend(title="N", fontsize=9, title_fontsize=9)
+    ax.legend(title="N", fontsize=7, title_fontsize=8, loc="best")
 
 
-# ── Individual chart functions ────────────────────────────────────────────────
-
-def chart_latency_vs_n(rows, groups, out_dir):
-    """2×2: mean, p50, p95, p99 latency vs N."""
-    fig, axes = plt.subplots(2, 2, figsize=(12, 9))
-    specs = [
-        ("latency_mean", "Latency (ms)", "Mean Latency vs N"),
-        ("latency_p50",  "Latency (ms)", "Median (p50) Latency vs N"),
-        ("latency_p95",  "Latency (ms)", "p95 Latency vs N"),
-        ("latency_p99",  "Latency (ms)", "p99 Latency vs N"),
-    ]
-    for ax, (key, ylabel, title) in zip(axes.flat, specs):
-        plot_metric_vs_n(ax, groups, key, ylabel, title)
-    fig.suptitle("Latency vs Network Size", fontsize=13, y=1.01)
-    fig.tight_layout()
-    savefig(fig, out_dir, "01_latency_vs_n.png")
-
-
-def chart_stretch_vs_n(rows, groups, out_dir):
-    """2×2: mean, p50, p95, p99 stretch vs N."""
-    fig, axes = plt.subplots(2, 2, figsize=(12, 9))
-    specs = [
-        ("stretch_mean", "Stretch (×)", "Mean Stretch vs N"),
-        ("stretch_p50",  "Stretch (×)", "Median (p50) Stretch vs N"),
-        ("stretch_p95",  "Stretch (×)", "p95 Stretch vs N"),
-        ("stretch_p99",  "Stretch (×)", "p99 Stretch vs N"),
-    ]
-    for ax, (key, ylabel, title) in zip(axes.flat, specs):
-        plot_metric_vs_n(ax, groups, key, ylabel, title)
-    fig.suptitle("Stretch vs Network Size", fontsize=13, y=1.01)
-    fig.tight_layout()
-    savefig(fig, out_dir, "02_stretch_vs_n.png")
-
-
-def chart_variability_vs_n(rows, groups, out_dir):
-    """1×2: latency stddev and stretch stddev vs N."""
-    fig, axes = plt.subplots(1, 2, figsize=(11, 4))
-    plot_metric_vs_n(axes[0], groups, "latency_stddev",
-                     "Latency StdDev (ms)", "Latency StdDev vs N")
-    plot_metric_vs_n(axes[1], groups, "stretch_stddev",
-                     "Stretch StdDev (×)", "Stretch StdDev vs N")
-    fig.suptitle("Variability vs Network Size", fontsize=13)
-    fig.tight_layout()
-    savefig(fig, out_dir, "03_variability_vs_n.png")
-
-
-def chart_tail_ratio_vs_n(rows, groups, out_dir):
-    """1×2: p99/p50 tail ratio for latency and stretch vs N."""
-    fig, axes = plt.subplots(1, 2, figsize=(11, 4))
-    for ax, stat in [(axes[0], "latency"), (axes[1], "stretch")]:
-        ns = sorted(groups.keys())
-        for proto in ("gossipsub", "spread"):
-            ratio_means, ns_plot = [], []
-            for n in ns:
-                ratios = [
-                    r[f"{proto}_{stat}_p99"] / r[f"{proto}_{stat}_p50"]
-                    for r in groups[n]
-                    if r[f"{proto}_{stat}_p50"] > 0
-                ]
-                if not ratios:
-                    continue
-                ratio_means.append(np.mean(ratios))
-                ns_plot.append(n)
-                for v in ratios:
-                    ax.scatter(n, v, color=PROTOCOL_COLORS[proto],
-                               alpha=0.35, s=25, zorder=3)
-            ax.plot(ns_plot, ratio_means, label=PROTOCOL_LABELS[proto],
-                    color=PROTOCOL_COLORS[proto], marker=MARKERS[proto],
-                    linewidth=2, markersize=7, zorder=4)
-        ax.axhline(1.0, color="gray", linestyle=":", linewidth=1)
-        ax.set_xlabel("Nodes (N)")
-        ax.set_ylabel("p99 / p50 ratio")
-        ax.set_title(f"{stat.capitalize()} Tail Ratio (p99/p50) vs N")
-        ax.set_xticks(ns)
-        ax.legend()
-    fig.suptitle("Tail Heaviness vs Network Size", fontsize=13)
-    fig.tight_layout()
-    savefig(fig, out_dir, "04_tail_ratio_vs_n.png")
-
-
-def chart_scatter_latency_mean(rows, out_dir):
-    """Scatter: mean latency — X=GossipSub, Y=Spread, coloured+marked by N."""
-    fig, ax = plt.subplots(figsize=(6, 6))
-    _scatter_one(
-        ax, rows, "latency_mean",
-        "Latency Scatter by N (mean)",
-        "Gossipsub Latency mean (ms) [X]",
-        "Spread Latency mean (ms) [Y]",
-    )
-    fig.tight_layout()
-    savefig(fig, out_dir, "05_scatter_latency_mean.png")
-
-
-def chart_scatter_latency_p50(rows, out_dir):
-    """Scatter: p50 latency — X=GossipSub, Y=Spread, coloured+marked by N."""
-    fig, ax = plt.subplots(figsize=(6, 6))
-    _scatter_one(
-        ax, rows, "latency_p50",
-        "Latency Scatter by N (p50)",
-        "Gossipsub Latency p50 (ms) [X]",
-        "Spread Latency p50 (ms) [Y]",
-    )
-    fig.tight_layout()
-    savefig(fig, out_dir, "06_scatter_latency_p50.png")
-
-
-def chart_scatter_stretch_mean(rows, out_dir):
-    """Scatter: mean stretch — X=GossipSub, Y=Spread, coloured+marked by N."""
-    fig, ax = plt.subplots(figsize=(6, 6))
-    _scatter_one(
-        ax, rows, "stretch_mean",
-        "Stretch Scatter by N (mean)",
-        "Gossipsub Stretch mean (×) [X]",
-        "Spread Stretch mean (×) [Y]",
-    )
-    fig.tight_layout()
-    savefig(fig, out_dir, "07_scatter_stretch_mean.png")
-
-
-def chart_scatter_stretch_p50(rows, out_dir):
-    """Scatter: p50 stretch — X=GossipSub, Y=Spread, coloured+marked by N."""
-    fig, ax = plt.subplots(figsize=(6, 6))
-    _scatter_one(
-        ax, rows, "stretch_p50",
-        "Stretch Scatter by N (p50)",
-        "Gossipsub Stretch p50 (×) [X]",
-        "Spread Stretch p50 (×) [Y]",
-    )
-    fig.tight_layout()
-    savefig(fig, out_dir, "08_scatter_stretch_p50.png")
-
-
-def chart_improvement_heatmap(rows, groups, out_dir):
+def _prepare_scatter_data(stats_df, metric_col, color_col):
     """
-    Heatmap of % improvement of Spread over GossipSub per (metric × N).
-    Positive values mean Spread is better (lower).
+    Pivot stats_df so GossipSub and Spread values are side-by-side per pair.
+    color_col determines how points are colored (n or seed).
     """
-    ns = sorted(groups.keys())
+    gs = stats_df[stats_df["protocol"] == "gossipsub"].copy()
+    sp = stats_df[stats_df["protocol"] == "spread"].copy()
+
+    # Build a merge key from all grouping columns except protocol
+    key_cols = [c for c in stats_df.columns if c not in
+                ("protocol", "count",
+                 "latency_mean", "latency_p50", "latency_p95", "latency_p99", "latency_std",
+                 "stretch_mean", "stretch_p50", "stretch_p95", "stretch_p99", "stretch_std")]
+
+    merged = gs.merge(sp, on=key_cols, suffixes=("_gs", "_sp"))
+    gs_vals = merged[f"{metric_col}_gs"].values
+    sp_vals = merged[f"{metric_col}_sp"].values
+    color_vals = merged[color_col].values
+
+    styles = n_styles(color_vals)
+    colors = [styles[v][0] for v in color_vals]
+    markers_list = [styles[v][1] for v in color_vals]
+    labels = [str(v) for v in color_vals]
+
+    return gs_vals, sp_vals, colors, markers_list, labels
+
+
+# -- Per-pair scatter charts ------------------------------------------------
+
+def chart_per_pair_scatter(pair_stats, out_dir, group_by):
+    """
+    Scatter plots of per-pair stats: GossipSub (X) vs Spread (Y).
+    4 stats x 2 metrics = 8 subplots, colored by N.
+    If group_by == 'n_seed', also produce a version colored by seed.
+    """
+    stats_specs = [
+        ("latency_mean", "Latency mean (ms)"),
+        ("latency_p50", "Latency p50 (ms)"),
+        ("latency_p95", "Latency p95 (ms)"),
+        ("latency_p99", "Latency p99 (ms)"),
+        ("stretch_mean", "Stretch mean"),
+        ("stretch_p50", "Stretch p50"),
+        ("stretch_p95", "Stretch p95"),
+        ("stretch_p99", "Stretch p99"),
+    ]
+
+    # Colored by N
+    fig, axes = plt.subplots(2, 4, figsize=(22, 10))
+    for ax, (col, label) in zip(axes.flat, stats_specs):
+        gs_v, sp_v, cs, ms, ls = _prepare_scatter_data(pair_stats, col, "n")
+        if len(gs_v) == 0:
+            ax.set_visible(False)
+            continue
+        _scatter_gs_vs_spread(ax, gs_v, sp_v, cs, ms, ls,
+                              f"Per-pair {label}", f"GossipSub {label}", f"Spread {label}")
+    fig.suptitle("Per-pair: GossipSub vs Spread (color = N)", fontsize=14, y=1.01)
+    fig.tight_layout()
+    savefig(fig, out_dir, "01_per_pair_scatter_by_n.png")
+
+    # Colored by seed (only if grouping by n_seed)
+    if group_by == "n_seed" and "seed" in pair_stats.columns:
+        fig, axes = plt.subplots(2, 4, figsize=(22, 10))
+        for ax, (col, label) in zip(axes.flat, stats_specs):
+            gs_v, sp_v, cs, ms, ls = _prepare_scatter_data(pair_stats, col, "seed")
+            if len(gs_v) == 0:
+                ax.set_visible(False)
+                continue
+            _scatter_gs_vs_spread(ax, gs_v, sp_v, cs, ms, ls,
+                                  f"Per-pair {label}", f"GossipSub {label}", f"Spread {label}")
+        fig.suptitle("Per-pair: GossipSub vs Spread (color = seed)", fontsize=14, y=1.01)
+        fig.tight_layout()
+        savefig(fig, out_dir, "02_per_pair_scatter_by_seed.png")
+
+
+# -- Per-topology scatter charts --------------------------------------------
+
+def chart_per_topology_scatter(topo_stats, out_dir):
+    """
+    Scatter plots of per-topology stats: GossipSub (X) vs Spread (Y).
+    4 stats x 2 metrics = 8 subplots, colored by N.
+    """
+    stats_specs = [
+        ("latency_mean", "Latency mean (ms)"),
+        ("latency_p50", "Latency p50 (ms)"),
+        ("latency_p95", "Latency p95 (ms)"),
+        ("latency_p99", "Latency p99 (ms)"),
+        ("stretch_mean", "Stretch mean"),
+        ("stretch_p50", "Stretch p50"),
+        ("stretch_p95", "Stretch p95"),
+        ("stretch_p99", "Stretch p99"),
+    ]
+
+    fig, axes = plt.subplots(2, 4, figsize=(22, 10))
+    for ax, (col, label) in zip(axes.flat, stats_specs):
+        gs_v, sp_v, cs, ms, ls = _prepare_scatter_data(topo_stats, col, "n")
+        if len(gs_v) == 0:
+            ax.set_visible(False)
+            continue
+        _scatter_gs_vs_spread(ax, gs_v, sp_v, cs, ms, ls,
+                              f"Per-topology {label}", f"GossipSub {label}", f"Spread {label}")
+    fig.suptitle("Per-topology: GossipSub vs Spread (color = N)", fontsize=14, y=1.01)
+    fig.tight_layout()
+    savefig(fig, out_dir, "03_per_topology_scatter_by_n.png")
+
+
+# -- CDF charts ------------------------------------------------------------
+
+def _cdf_plot(ax, gs_vals, sp_vals, title, xlabel):
+    """CDF comparison on a given axes."""
+    for vals, proto in [(gs_vals, "gossipsub"), (sp_vals, "spread")]:
+        sorted_v = np.sort(vals)
+        cdf = np.arange(1, len(sorted_v) + 1) / len(sorted_v)
+        ax.plot(sorted_v, cdf, color=PROTOCOL_COLORS[proto],
+                label=PROTOCOL_LABELS[proto], linewidth=1.5)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("CDF")
+    ax.set_title(title)
+    ax.legend(fontsize=8)
+
+
+def chart_cdf_per_pair(pair_stats, out_dir):
+    """CDF of per-pair aggregated stats: latency mean and stretch mean."""
+    gs = pair_stats[pair_stats["protocol"] == "gossipsub"]
+    sp = pair_stats[pair_stats["protocol"] == "spread"]
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    _cdf_plot(axes[0], gs["latency_mean"].values, sp["latency_mean"].values,
+              "CDF of Per-pair Mean Latency", "Mean latency (ms)")
+    _cdf_plot(axes[1], gs["stretch_mean"].values, sp["stretch_mean"].values,
+              "CDF of Per-pair Mean Stretch", "Mean stretch")
+    fig.suptitle("Per-pair CDF", fontsize=13)
+    fig.tight_layout()
+    savefig(fig, out_dir, "04_cdf_per_pair.png")
+
+
+def chart_cdf_per_topology(topo_stats, out_dir):
+    """CDF of per-topology aggregated stats: latency mean and stretch mean."""
+    gs = topo_stats[topo_stats["protocol"] == "gossipsub"]
+    sp = topo_stats[topo_stats["protocol"] == "spread"]
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    _cdf_plot(axes[0], gs["latency_mean"].values, sp["latency_mean"].values,
+              "CDF of Per-topology Mean Latency", "Mean latency (ms)")
+    _cdf_plot(axes[1], gs["stretch_mean"].values, sp["stretch_mean"].values,
+              "CDF of Per-topology Mean Stretch", "Mean stretch")
+    fig.suptitle("Per-topology CDF", fontsize=13)
+    fig.tight_layout()
+    savefig(fig, out_dir, "05_cdf_per_topology.png")
+
+
+def chart_cdf_raw(df, out_dir):
+    """CDF of raw observations: latency and stretch."""
+    gs = df[df["protocol"] == "gossipsub"]
+    sp = df[df["protocol"] == "spread"]
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    _cdf_plot(axes[0], gs["latency_ms"].values, sp["latency_ms"].values,
+              "CDF of Raw Latency", "Latency (ms)")
+    _cdf_plot(axes[1], gs["stretch"].values, sp["stretch"].values,
+              "CDF of Raw Stretch", "Stretch")
+    fig.suptitle("Raw observations CDF (all pairs, all trials)", fontsize=13)
+    fig.tight_layout()
+    savefig(fig, out_dir, "06_cdf_raw.png")
+
+
+# -- Improvement heatmap ----------------------------------------------------
+
+def chart_improvement_heatmap(topo_stats, out_dir):
+    """
+    Heatmap of % improvement of Spread over GossipSub per (metric x N).
+    Positive = Spread is better (lower).
+    """
     metrics = [
-        ("latency_mean",   "Latency mean"),
-        ("latency_p50",    "Latency p50"),
-        ("latency_p95",    "Latency p95"),
-        ("latency_p99",    "Latency p99"),
-        ("latency_stddev", "Latency stddev"),
-        ("stretch_mean",   "Stretch mean"),
-        ("stretch_p50",    "Stretch p50"),
-        ("stretch_p95",    "Stretch p95"),
-        ("stretch_p99",    "Stretch p99"),
-        ("stretch_stddev", "Stretch stddev"),
+        ("latency_mean", "Latency mean"),
+        ("latency_p50", "Latency p50"),
+        ("latency_p95", "Latency p95"),
+        ("latency_p99", "Latency p99"),
+        ("latency_std", "Latency std"),
+        ("stretch_mean", "Stretch mean"),
+        ("stretch_p50", "Stretch p50"),
+        ("stretch_p95", "Stretch p95"),
+        ("stretch_p99", "Stretch p99"),
+        ("stretch_std", "Stretch std"),
     ]
+
+    gs = topo_stats[topo_stats["protocol"] == "gossipsub"]
+    sp = topo_stats[topo_stats["protocol"] == "spread"]
+
+    ns = sorted(topo_stats["n"].unique())
+
+    # Average across runs for each N
+    gs_by_n = gs.groupby("n").mean(numeric_only=True)
+    sp_by_n = sp.groupby("n").mean(numeric_only=True)
+
     data = np.zeros((len(metrics), len(ns)))
     for j, n in enumerate(ns):
-        grp = groups[n]
-        for i, (key, _) in enumerate(metrics):
-            g_mean = np.mean([r[f"gossipsub_{key}"] for r in grp])
-            s_mean = np.mean([r[f"spread_{key}"] for r in grp])
-            if g_mean != 0:
-                data[i, j] = (g_mean - s_mean) / abs(g_mean) * 100
+        if n not in gs_by_n.index or n not in sp_by_n.index:
+            continue
+        for i, (col, _) in enumerate(metrics):
+            g_val = gs_by_n.loc[n, col]
+            s_val = sp_by_n.loc[n, col]
+            if g_val != 0:
+                data[i, j] = (g_val - s_val) / abs(g_val) * 100
 
     fig_w = max(6, len(ns) * 1.8)
     fig, ax = plt.subplots(figsize=(fig_w, 6))
     sns.heatmap(
-        data,
-        ax=ax,
-        annot=True, fmt=".1f",
+        data, ax=ax, annot=True, fmt=".1f",
         xticklabels=[f"N={n}" for n in ns],
         yticklabels=[m[1] for m in metrics],
-        center=0,
-        cmap="RdYlGn",
-        linewidths=0.5,
+        center=0, cmap="RdYlGn", linewidths=0.5,
         cbar_kws={"label": "% improvement (positive = Spread wins)"},
     )
     ax.set_title("Spread vs GossipSub: % Improvement per Metric per N")
     fig.tight_layout()
-    savefig(fig, out_dir, "09_improvement_heatmap.png")
+    savefig(fig, out_dir, "07_improvement_heatmap.png")
 
 
-def chart_distributions(rows, out_dir):
+# -- Distribution charts ----------------------------------------------------
+
+def chart_distributions(df, out_dir):
     """
-    2×2 histogram / density comparison:
-      - Latency p50 distribution (both protocols)
-      - Latency p95 distribution (both protocols)
-      - Stretch p50 distribution (both protocols)
-      - Delta latency p50 (Spread − GossipSub) with x=0 reference line
-    All runs are pooled across N values.
+    2x2 histogram comparison of raw observations:
+      - Latency distribution (both protocols)
+      - Stretch distribution (both protocols)
+      - Delta latency (Spread - GossipSub) per trial with x=0 reference
+      - Delta stretch (Spread - GossipSub) per trial with x=0 reference
     """
-    g_lat_p50 = [r["gossipsub_latency_p50"] for r in rows]
-    s_lat_p50 = [r["spread_latency_p50"]    for r in rows]
-    g_lat_p95 = [r["gossipsub_latency_p95"] for r in rows]
-    s_lat_p95 = [r["spread_latency_p95"]    for r in rows]
-    g_str_p50 = [r["gossipsub_stretch_p50"] for r in rows]
-    s_str_p50 = [r["spread_stretch_p50"]    for r in rows]
+    gs = df[df["protocol"] == "gossipsub"]
+    sp = df[df["protocol"] == "spread"]
 
-    fig, axes = plt.subplots(2, 2, figsize=(11, 8))
+    fig, axes = plt.subplots(2, 2, figsize=(12, 9))
 
-    def _hist(ax, g_vals, s_vals, title, xlabel):
-        bins = min(20, max(5, len(g_vals) // 2))
-        ax.hist(g_vals, bins=bins, alpha=0.5, density=True,
+    def _hist(ax, gs_vals, sp_vals, title, xlabel):
+        bins = min(50, max(10, len(gs_vals) // 50))
+        ax.hist(gs_vals, bins=bins, alpha=0.5, density=True,
                 color=PROTOCOL_COLORS["gossipsub"],
                 label=PROTOCOL_LABELS["gossipsub"])
-        ax.hist(s_vals, bins=bins, alpha=0.5, density=True,
+        ax.hist(sp_vals, bins=bins, alpha=0.5, density=True,
                 color=PROTOCOL_COLORS["spread"],
                 label=PROTOCOL_LABELS["spread"])
         ax.set_title(title)
@@ -357,80 +439,107 @@ def chart_distributions(rows, out_dir):
         ax.set_ylabel("Density")
         ax.legend(fontsize=8)
 
-    _hist(axes[0, 0], g_lat_p50, s_lat_p50,
-          "Latency p50 Distribution", "ms")
-    _hist(axes[0, 1], g_lat_p95, s_lat_p95,
-          "Latency p95 Distribution", "ms")
-    _hist(axes[1, 0], g_str_p50, s_str_p50,
-          "Stretch p50 Distribution", "stretch (×)")
+    _hist(axes[0, 0], gs["latency_ms"].values, sp["latency_ms"].values,
+          "Latency Distribution", "ms")
+    _hist(axes[0, 1], gs["stretch"].values, sp["stretch"].values,
+          "Stretch Distribution", "stretch (x)")
 
-    # Delta: Spread − GossipSub for latency p50
-    deltas = [s - g for s, g in zip(s_lat_p50, g_lat_p50)]
-    ax = axes[1, 1]
-    bins = min(20, max(5, len(deltas) // 2))
-    ax.hist(deltas, bins=bins, density=True, color="#4c9e8e", alpha=0.85)
+    # Compute per-trial mean deltas: match trials by (run_idx, trial)
+    trial_means = df.groupby(["run_idx", "trial", "protocol"], as_index=False).agg(
+        lat=("latency_ms", "mean"),
+        st=("stretch", "mean"),
+    )
+    gs_t = trial_means[trial_means["protocol"] == "gossipsub"]
+    sp_t = trial_means[trial_means["protocol"] == "spread"]
+    merged = gs_t.merge(sp_t, on=["run_idx", "trial"], suffixes=("_gs", "_sp"))
+
+    delta_lat = merged["lat_sp"].values - merged["lat_gs"].values
+    delta_st = merged["st_sp"].values - merged["st_gs"].values
+
+    # Delta latency
+    ax = axes[1, 0]
+    bins = min(50, max(10, len(delta_lat) // 20))
+    ax.hist(delta_lat, bins=bins, density=True, color="#4c9e8e", alpha=0.85)
     ax.axvline(0, color="black", linestyle="--", linewidth=1.5)
-    ax.set_title("Delta Latency p50 (Spread − GossipSub)")
+    ax.set_title("Delta Mean Latency per Trial (Spread - GossipSub)")
     ax.set_xlabel("ms")
     ax.set_ylabel("Density")
 
-    fig.suptitle("Distribution Comparison — all runs pooled", fontsize=13)
+    # Delta stretch
+    ax = axes[1, 1]
+    bins = min(50, max(10, len(delta_st) // 20))
+    ax.hist(delta_st, bins=bins, density=True, color="#8e6ea0", alpha=0.85)
+    ax.axvline(0, color="black", linestyle="--", linewidth=1.5)
+    ax.set_title("Delta Mean Stretch per Trial (Spread - GossipSub)")
+    ax.set_xlabel("stretch (x)")
+    ax.set_ylabel("Density")
+
+    fig.suptitle("Distribution Comparison -- all runs pooled", fontsize=13)
     fig.tight_layout()
-    savefig(fig, out_dir, "10_distributions.png")
+    savefig(fig, out_dir, "08_distributions.png")
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# -- Main -------------------------------------------------------------------
 
 def main():
-    default_results = os.path.join(
-        "simnet_spread_tests", "outputs", "results.jsonl"
-    )
-    default_out = os.path.join(
-        "simnet_spread_tests", "outputs", "plots"
-    )
+    default_out_base = os.path.join("simnet_spread_tests", "outputs")
+    default_runs = os.path.join(default_out_base, "runs")
+    default_results = os.path.join(default_out_base, "results.jsonl")
+    default_plots = os.path.join(default_out_base, "plots")
 
     parser = argparse.ArgumentParser(
-        description="Plot simnet spread experiment results."
+        description="Plot simnet spread experiment results from raw per-pair data."
     )
     parser.add_argument(
-        "--results",
-        default=default_results,
-        help=f"Path to results.jsonl (default: {default_results})",
+        "--runs-dir", default=default_runs,
+        help=f"Directory containing per-run JSON exports (default: {default_runs})",
     )
     parser.add_argument(
-        "--out",
-        default=default_out,
-        help=f"Output directory for plots (default: {default_out})",
+        "--results", default=default_results,
+        help=f"Path to results.jsonl for finding successful runs (default: {default_results})",
+    )
+    parser.add_argument(
+        "--out", default=default_plots,
+        help=f"Output directory for plots (default: {default_plots})",
+    )
+    parser.add_argument(
+        "--group-by", choices=["n_seed", "n"], default="n_seed",
+        help="Grouping for per-pair/per-topology stats: n_seed (default) or n",
     )
     args = parser.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
 
-    print(f"Loading results from {args.results} ...")
-    records = load_results(args.results)
-    if not records:
-        print("No successful runs found in results.jsonl.", file=sys.stderr)
+    print(f"Loading run exports from {args.runs_dir} ...")
+    exports = load_run_exports(args.runs_dir, args.results)
+    if not exports:
+        print("No run exports found.", file=sys.stderr)
         sys.exit(1)
-    print(f"  {len(records)} successful run(s) loaded.")
+    print(f"  {len(exports)} run(s) loaded.")
 
-    rows = extract_rows(records)
-    groups = grouped_by_n(rows)
-    ns = sorted(groups.keys())
-    print(f"  N values: {ns}")
-    for n in ns:
-        print(f"    N={n}: {len(groups[n])} run(s)")
+    print("Flattening observations ...")
+    df = flatten_observations(exports)
+    if df.empty:
+        print("No observations found in exports.", file=sys.stderr)
+        sys.exit(1)
+    print(f"  {len(df)} raw observations across {df['run_idx'].nunique()} runs.")
+    print(f"  N values: {sorted(df['n'].unique())}")
+    print(f"  Seeds: {sorted(df['seed'].unique())}")
+
+    group_by = args.group_by
+    print(f"Computing stats (group-by={group_by}) ...")
+    pair_stats = build_per_pair_stats(df, group_by)
+    topo_stats = build_per_topology_stats(df, group_by)
+    print(f"  {len(pair_stats)} per-pair stat rows, {len(topo_stats)} per-topology stat rows.")
 
     print("Generating charts ...")
-    chart_latency_vs_n(rows, groups, args.out)
-    chart_stretch_vs_n(rows, groups, args.out)
-    chart_variability_vs_n(rows, groups, args.out)
-    chart_tail_ratio_vs_n(rows, groups, args.out)
-    chart_scatter_latency_mean(rows, args.out)
-    chart_scatter_latency_p50(rows, args.out)
-    chart_scatter_stretch_mean(rows, args.out)
-    chart_scatter_stretch_p50(rows, args.out)
-    chart_improvement_heatmap(rows, groups, args.out)
-    chart_distributions(rows, args.out)
+    chart_per_pair_scatter(pair_stats, args.out, group_by)
+    chart_per_topology_scatter(topo_stats, args.out)
+    chart_cdf_per_pair(pair_stats, args.out)
+    chart_cdf_per_topology(topo_stats, args.out)
+    chart_cdf_raw(df, args.out)
+    chart_improvement_heatmap(topo_stats, args.out)
+    chart_distributions(df, args.out)
     print("Done.")
 
 

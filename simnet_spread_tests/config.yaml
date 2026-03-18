@@ -8,7 +8,6 @@ batch:
 simnet:
   spread_simnet_nodes: 30
   spread_simnet_trials: 50
-  spread_simnet_window_size: 1000 # window size > trials -> one window only
   spread_simnet_seed: 1337
   spread_simnet_warmup_every: 0
   spread_simnet_warmup_rounds_per_publish: 1
