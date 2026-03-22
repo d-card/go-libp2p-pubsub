@@ -293,13 +293,16 @@ func runBatch(opts batchOptions, baseEnv map[string]string, baseCfg runConfig, e
 		runLabel := fmt.Sprintf("run-%06d", runID)
 		exportPath := filepath.Join(runsDir, runLabel+".json")
 
+		runCfg := baseCfg
+		runCfg.Seed = baseCfg.Seed + runID
+
 		for attempt := 0; attempt <= opts.MaxRetries; attempt++ {
 			_ = os.Remove(exportPath)
 			logPath := filepath.Join(logsDir, fmt.Sprintf("%s-attempt-%02d.log", runLabel, attempt))
 
 			start := time.Now().UTC()
 			ctx, cancel := context.WithTimeout(context.Background(), opts.PerRunTimeout)
-			outcome := execFn(ctx, runID, attempt, runLabel, exportPath, logPath, gitCommit, baseCfg, baseEnv)
+			outcome := execFn(ctx, runID, attempt, runLabel, exportPath, logPath, gitCommit, runCfg, baseEnv)
 			cancel()
 			end := time.Now().UTC()
 
@@ -316,7 +319,7 @@ func runBatch(opts batchOptions, baseEnv map[string]string, baseCfg runConfig, e
 				ExportPath: exportPath,
 				LogPath:    logPath,
 				GitCommit:  gitCommit,
-				Config:     baseCfg,
+				Config:     runCfg,
 			}
 			if err := appendJSONLine(resultsPath, rec); err != nil {
 				return err
@@ -358,6 +361,7 @@ func runBatch(opts batchOptions, baseEnv map[string]string, baseCfg runConfig, e
 
 func executeGoTestRun(ctx context.Context, runID, attempt int, runIDLabel, exportPath, logPath, gitCommit string, cfg runConfig, env map[string]string) executionOutcome {
 	envCopy := cloneEnvMap(env)
+	envCopy[spreadSeedEnv] = strconv.Itoa(cfg.Seed)
 	envCopy[spreadExportPathEnv] = exportPath
 	envCopy[spreadRunIDEnv] = runIDLabel
 	envCopy[spreadGitCommitEnv] = gitCommit
