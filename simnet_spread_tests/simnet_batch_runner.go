@@ -44,6 +44,7 @@ const (
 	spreadInterProbEnv         = "SPREAD_INTER_PROB"
 	spreadFallbackThresholdEnv = "SPREAD_FALLBACK_THRESHOLD"
 	spreadDuplicateRepropEnv   = "SPREAD_DUPLICATE_REPROPAGATION"
+	spreadUseAngularInterEnv   = "SPREAD_USE_ANGULAR_INTER_PEERS"
 	spreadCcEnv                = "SPREAD_CC"
 	spreadCeEnv                = "SPREAD_CE"
 	spreadNewtonEnv            = "SPREAD_NEWTON"
@@ -82,6 +83,7 @@ type runConfig struct {
 	SpreadInterProb   float64 `json:"spread_inter_prob"`
 	SpreadFallback    int     `json:"spread_fallback_threshold"`
 	SpreadDupReprop   int     `json:"spread_duplicate_repropagation"`
+	SpreadUseAngular  bool    `json:"spread_use_angular_inter_peers"`
 	SpreadCC          float64 `json:"spread_cc"`
 	SpreadCE          float64 `json:"spread_ce"`
 	SpreadNewton      bool    `json:"spread_newton"`
@@ -174,6 +176,7 @@ type spreadConfigYAML struct {
 	InterProb              *float64 `yaml:"spread_inter_prob"`
 	FallbackThreshold      *int     `yaml:"spread_fallback_threshold"`
 	DuplicateRepropagation *int     `yaml:"spread_duplicate_repropagation"`
+	UseAngularInterPeers   *bool    `yaml:"spread_use_angular_inter_peers"`
 	CC                     *float64 `yaml:"spread_cc"`
 	CE                     *float64 `yaml:"spread_ce"`
 	Newton                 *bool    `yaml:"spread_newton"`
@@ -481,6 +484,7 @@ func defaultFileConfig() fileConfig {
 	interProb := 0.8
 	fallback := 3
 	dupReprop := 5
+	useAngularInter := true
 	cc := 0.25
 	ce := 0.25
 	newton := false
@@ -520,6 +524,7 @@ func defaultFileConfig() fileConfig {
 			InterProb:              &interProb,
 			FallbackThreshold:      &fallback,
 			DuplicateRepropagation: &dupReprop,
+			UseAngularInterPeers:   &useAngularInter,
 			CC:                     &cc,
 			CE:                     &ce,
 			Newton:                 &newton,
@@ -567,6 +572,7 @@ func validateConfig(cfg fileConfig) error {
 	require(cfg.Spread.InterProb != nil, "spread.spread_inter_prob")
 	require(cfg.Spread.FallbackThreshold != nil, "spread.spread_fallback_threshold")
 	require(cfg.Spread.DuplicateRepropagation != nil, "spread.spread_duplicate_repropagation")
+	require(cfg.Spread.UseAngularInterPeers != nil, "spread.spread_use_angular_inter_peers")
 	require(cfg.Spread.CC != nil, "spread.spread_cc")
 	require(cfg.Spread.CE != nil, "spread.spread_ce")
 	require(cfg.Spread.Newton != nil, "spread.spread_newton")
@@ -606,6 +612,7 @@ func configToEnvMap(cfg fileConfig) map[string]string {
 		spreadInterProbEnv:         fmt.Sprintf("%g", *cfg.Spread.InterProb),
 		spreadFallbackThresholdEnv: strconv.Itoa(*cfg.Spread.FallbackThreshold),
 		spreadDuplicateRepropEnv:   strconv.Itoa(*cfg.Spread.DuplicateRepropagation),
+		spreadUseAngularInterEnv:   strconv.FormatBool(*cfg.Spread.UseAngularInterPeers),
 		spreadCcEnv:                fmt.Sprintf("%g", *cfg.Spread.CC),
 		spreadCeEnv:                fmt.Sprintf("%g", *cfg.Spread.CE),
 		spreadNewtonEnv:            strconv.FormatBool(*cfg.Spread.Newton),
@@ -638,6 +645,7 @@ func configFromEnv(env map[string]string) runConfig {
 	cfg.SpreadInterProb = envFloatFromMap(env, spreadInterProbEnv)
 	cfg.SpreadFallback = envIntFromMap(env, spreadFallbackThresholdEnv)
 	cfg.SpreadDupReprop = envIntFromMap(env, spreadDuplicateRepropEnv)
+	cfg.SpreadUseAngular = envBoolFromMap(env, spreadUseAngularInterEnv)
 	cfg.SpreadCC = envFloatFromMap(env, spreadCcEnv)
 	cfg.SpreadCE = envFloatFromMap(env, spreadCeEnv)
 	cfg.SpreadNewton = envBoolFromMap(env, spreadNewtonEnv)

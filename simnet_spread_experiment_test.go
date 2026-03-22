@@ -50,6 +50,7 @@ const (
 	SPREAD_INTER_PROB              = "SPREAD_INTER_PROB"
 	SPREAD_FALLBACK_THRESHOLD      = "SPREAD_FALLBACK_THRESHOLD"
 	SPREAD_DUPLICATE_REPROPAGATION = "SPREAD_DUPLICATE_REPROPAGATION"
+	SPREAD_USE_ANGULAR_INTER_PEERS = "SPREAD_USE_ANGULAR_INTER_PEERS"
 	SPREAD_CC                      = "SPREAD_CC"
 	SPREAD_CE                      = "SPREAD_CE"
 	SPREAD_NEWTON                  = "SPREAD_NEWTON"
@@ -650,6 +651,7 @@ func spreadPropagationConfigFromEnv() *SpreadConfig {
 		InterProb:              envFloat(SPREAD_INTER_PROB, DefaultSpreadInterProb),
 		FallbackThreshold:      envInt(SPREAD_FALLBACK_THRESHOLD, DefaultSpreadFallbackMin),
 		DuplicateRepropagation: envInt(SPREAD_DUPLICATE_REPROPAGATION, 5),
+		UseAngularInterPeers:   envBool(SPREAD_USE_ANGULAR_INTER_PEERS, false),
 	}
 }
 

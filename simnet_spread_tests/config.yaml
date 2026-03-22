@@ -23,6 +23,7 @@ spread:
   spread_inter_prob: 0.8
   spread_fallback_threshold: 3 # Less than this -> use gossipsub mesh to populate
   spread_duplicate_repropagation: 5 # Number of times to repropagate a message
+  spread_use_angular_inter_peers: true
 
   spread_cc: 0.25
   spread_ce: 0.25
