@@ -120,20 +120,21 @@ def build_per_pair_stats(df: pd.DataFrame, group_by: str) -> pd.DataFrame:
     else:
         grp_cols = ["n", "protocol", "src", "dst"]
 
-    agg = df.groupby(grp_cols, as_index=False).agg(
+    # Use groupby().quantile([...]) instead of lambdas + np.percentile: lambdas force
+    # Python groupby aggregation and are very slow for large group counts.
+    gb = df.groupby(grp_cols, sort=False)
+    means = gb.agg(
         latency_mean=("latency_ms", "mean"),
-        latency_p50=("latency_ms", "median"),
-        latency_p95=("latency_ms", lambda x: np.percentile(x, 95)),
-        latency_p99=("latency_ms", lambda x: np.percentile(x, 99)),
         latency_std=("latency_ms", "std"),
         stretch_mean=("stretch", "mean"),
-        stretch_p50=("stretch", "median"),
-        stretch_p95=("stretch", lambda x: np.percentile(x, 95)),
-        stretch_p99=("stretch", lambda x: np.percentile(x, 99)),
         stretch_std=("stretch", "std"),
         count=("latency_ms", "count"),
     )
-    return agg
+    lat_q = gb["latency_ms"].quantile([0.5, 0.95, 0.99]).unstack()
+    lat_q.columns = ["latency_p50", "latency_p95", "latency_p99"]
+    st_q = gb["stretch"].quantile([0.5, 0.95, 0.99]).unstack()
+    st_q.columns = ["stretch_p50", "stretch_p95", "stretch_p99"]
+    return pd.concat([means, lat_q, st_q], axis=1).reset_index()
 
 
 def build_per_topology_stats(df: pd.DataFrame, group_by: str) -> pd.DataFrame:
@@ -147,20 +148,19 @@ def build_per_topology_stats(df: pd.DataFrame, group_by: str) -> pd.DataFrame:
     else:
         grp_cols = ["n", "protocol"]
 
-    agg = df.groupby(grp_cols, as_index=False).agg(
+    gb = df.groupby(grp_cols, sort=False)
+    means = gb.agg(
         latency_mean=("latency_ms", "mean"),
-        latency_p50=("latency_ms", "median"),
-        latency_p95=("latency_ms", lambda x: np.percentile(x, 95)),
-        latency_p99=("latency_ms", lambda x: np.percentile(x, 99)),
         latency_std=("latency_ms", "std"),
         stretch_mean=("stretch", "mean"),
-        stretch_p50=("stretch", "median"),
-        stretch_p95=("stretch", lambda x: np.percentile(x, 95)),
-        stretch_p99=("stretch", lambda x: np.percentile(x, 99)),
         stretch_std=("stretch", "std"),
         count=("latency_ms", "count"),
     )
-    return agg
+    lat_q = gb["latency_ms"].quantile([0.5, 0.95, 0.99]).unstack()
+    lat_q.columns = ["latency_p50", "latency_p95", "latency_p99"]
+    st_q = gb["stretch"].quantile([0.5, 0.95, 0.99]).unstack()
+    st_q.columns = ["stretch_p50", "stretch_p95", "stretch_p99"]
+    return pd.concat([means, lat_q, st_q], axis=1).reset_index()
 
 
 # -- I/O helper -------------------------------------------------------------
@@ -176,16 +176,33 @@ def savefig(fig, out_dir: str, name: str):
 
 def _scatter_gs_vs_spread(ax, gs_vals, sp_vals, colors, markers, labels, title, xlabel, ylabel):
     """Draw GossipSub (X) vs Spread (Y) scatter with x=y line."""
-    lo = min(min(gs_vals), min(sp_vals)) * 0.95
-    hi = max(max(gs_vals), max(sp_vals)) * 1.05
+    g_arr = np.asarray(gs_vals, dtype=float)
+    s_arr = np.asarray(sp_vals, dtype=float)
+    colors_arr = np.asarray(colors, dtype=object)
+    markers_arr = np.asarray(markers, dtype=object)
+    labels_arr = np.asarray(labels, dtype=object)
+
+    lo = float(min(g_arr.min(), s_arr.min()) * 0.95)
+    hi = float(max(g_arr.max(), s_arr.max()) * 1.05)
     ax.plot([lo, hi], [lo, hi], "k--", linewidth=1.5, alpha=0.65, label="X = Y", zorder=1)
 
+    # One scatter per distinct label (not per point). Per-point scatter() calls are
+    # catastrophically slow at ~1e5 points (matplotlib autoscale cost explodes).
+    order = []
     seen = set()
-    for g, s, c, m, lbl in zip(gs_vals, sp_vals, colors, markers, labels):
-        show_lbl = lbl if lbl not in seen else None
-        seen.add(lbl)
-        ax.scatter(g, s, color=c, marker=m, s=50, zorder=3,
-                   label=show_lbl, edgecolors="white", linewidths=0.4, alpha=0.7)
+    for lbl in labels_arr:
+        if lbl not in seen:
+            seen.add(lbl)
+            order.append(lbl)
+    for lbl in order:
+        mask = labels_arr == lbl
+        idx = int(np.flatnonzero(mask)[0])
+        c = colors_arr[idx]
+        m = markers_arr[idx]
+        ax.scatter(
+            g_arr[mask], s_arr[mask], color=c, marker=m, s=50, zorder=3,
+            label=str(lbl), edgecolors="white", linewidths=0.4, alpha=0.7,
+        )
 
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
