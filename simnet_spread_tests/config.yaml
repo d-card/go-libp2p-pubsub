@@ -1,0 +1,39 @@
+batch:
+  runs: 100
+  out_dir: simnet_spread_tests/outputs
+  max_retries: 2
+  per_run_timeout: 25m
+  resume: true
+
+simnet:
+  spread_simnet_nodes: 30
+  spread_simnet_trials: 50
+  spread_simnet_seed: 1337
+  spread_simnet_warmup_every: 0
+  spread_simnet_warmup_rounds_per_publish: 1
+  spread_simnet_link_mibps: 20
+  spread_simnet_scenario_timeout_ms: 1800000 # 30 minutes
+
+spread:
+  spread_cluster_pct: 0.25
+  spread_num_rings: 4 # Unused for now
+  spread_intra_fanout: 3
+  spread_inter_fanout: 8
+  spread_intra_rho: 0.6
+  spread_inter_prob: 0.8
+  spread_fallback_threshold: 3 # Less than this -> use gossipsub mesh to populate
+  spread_duplicate_repropagation: 5 # Number of times to repropagate a message
+  spread_use_angular_inter_peers: true
+
+  spread_cc: 0.25
+  spread_ce: 0.25
+  spread_newton: false # to use or not Newton
+  spread_outlier_threshold: 0
+  spread_samples: 1 # number of pings to exchange, to extract median, and use median in update
+  spread_interval_ms: 150
+  spread_neighbor_set_size: 24
+  spread_in1_threshold_ms: 20
+  spread_in2_threshold_ms: 35
+  spread_in3_madk_random: 5
+  spread_in3_madk_close: 8
+  spread_in3_min_samples: 4
