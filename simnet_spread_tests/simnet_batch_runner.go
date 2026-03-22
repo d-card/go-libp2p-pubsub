@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,6 +19,9 @@ import (
 
 	"gopkg.in/yaml.v3"
 )
+
+// stderr logger for batch progress (timestamps help on long runs).
+var batchLog = log.New(os.Stderr, "simnet-batch: ", log.LstdFlags)
 
 const (
 	testName                   = "TestSimnetSpreadVsGossipsubLatencyStretch"
@@ -288,6 +292,8 @@ func runBatch(opts batchOptions, baseEnv map[string]string, baseCfg runConfig, e
 	}
 
 	gitCommit := currentGitCommit()
+	batchLog.Printf("starting batch out_dir=%s target_runs=%d next_run=%d resume=%v per_run_timeout=%s max_retries=%d base_seed=%d nodes=%d trials=%d git=%s",
+		opts.OutDir, opts.Runs, cp.NextRun, opts.Resume, opts.PerRunTimeout, opts.MaxRetries, baseCfg.Seed, baseCfg.Nodes, baseCfg.Trials, gitCommit)
 
 	for runID := cp.NextRun; runID < opts.Runs; runID++ {
 		runLabel := fmt.Sprintf("run-%06d", runID)
@@ -301,10 +307,26 @@ func runBatch(opts batchOptions, baseEnv map[string]string, baseCfg runConfig, e
 			logPath := filepath.Join(logsDir, fmt.Sprintf("%s-attempt-%02d.log", runLabel, attempt))
 
 			start := time.Now().UTC()
+			batchLog.Printf("%s attempt %d/%d seed=%d starting (log %s)",
+				runLabel, attempt+1, opts.MaxRetries+1, runCfg.Seed, logPath)
+
 			ctx, cancel := context.WithTimeout(context.Background(), opts.PerRunTimeout)
 			outcome := execFn(ctx, runID, attempt, runLabel, exportPath, logPath, gitCommit, runCfg, baseEnv)
 			cancel()
 			end := time.Now().UTC()
+			dur := end.Sub(start).Round(time.Millisecond)
+
+			errSnippet := outcome.ErrText
+			if len(errSnippet) > 400 {
+				errSnippet = errSnippet[:400] + "…"
+			}
+			if errSnippet != "" {
+				batchLog.Printf("%s attempt %d/%d finished status=%s duration=%s err=%q",
+					runLabel, attempt+1, opts.MaxRetries+1, outcome.Status, dur, errSnippet)
+			} else {
+				batchLog.Printf("%s attempt %d/%d finished status=%s duration=%s",
+					runLabel, attempt+1, opts.MaxRetries+1, outcome.Status, dur)
+			}
 
 			rec := attemptRecord{
 				RunID:      runID,
@@ -356,6 +378,8 @@ func runBatch(opts batchOptions, baseEnv map[string]string, baseCfg runConfig, e
 		}
 	}
 
+	batchLog.Printf("batch finished success=%d failed=%d timeout=%d completed_runs=%d attempts=%d next_run=%d",
+		cp.SuccessRuns, cp.FailedRuns, cp.TimeoutRuns, cp.Completed, cp.Attempts, cp.NextRun)
 	return nil
 }
 
