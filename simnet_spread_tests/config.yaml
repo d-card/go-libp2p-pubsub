@@ -37,3 +37,4 @@ spread:
   spread_in3_madk_random: 5
   spread_in3_madk_close: 8
   spread_in3_min_samples: 4
+  spread_attacker_pcts: "0.1,0.2,0.3,0.4,0.5" # comma-separated percentages in (0,1], e.g. "0.1,0.2"

@@ -58,7 +58,7 @@ outputs/
     *.png
 ```
 
-Each `run-NNNNNN.json` contains the raw per-pair, per-trial observations:
+Each `run-NNNNNN.json` contains raw per-pair and first-receipt data per trial:
 
 ```json
 {
@@ -68,15 +68,35 @@ Each `run-NNNNNN.json` contains the raw per-pair, per-trial observations:
   "gossipsub": [
     {"trial": 0, "src": 31, "deliveries": [
       {"dst": 3, "latency_ms": 53.9, "stretch": 1.15}, ...
+    ],
+    "first_receipts": [
+      {"node": 31, "first_from": 31, "received_delay_ms": 0.0},
+      {"node": 3, "first_from": 31, "received_delay_ms": 53.9}, ...
+    ],
+    "attacker_estimates": [
+      {
+        "attacker_pct": 0.2,
+        "attacker_count": 6,
+        "estimated_source": 31,
+        "true_source": 31,
+        "is_correct": true,
+        "observed_by_attacker": 12,
+        "observed_delay_ms": 41.7
+      }
     ]}, ...
   ],
-  "spread": [ ... ]
+  "spread": [ ... ],
+  "gossipsub_attacker_accuracy": [
+    {"attacker_pct": 0.2, "trials_observed": 50, "correct_estimates": 17, "accuracy": 0.34}
+  ],
+  "spread_attacker_accuracy": [ ... ]
 }
 ```
 
 Notes:
 - Directory is created automatically if it does not exist.
 - Resume uses `checkpoint.json` + existing `results.jsonl`.
+- `received_delay_ms` is measured from the publish time (oracle latency for experimentation).
 
 
 ## Plot Results

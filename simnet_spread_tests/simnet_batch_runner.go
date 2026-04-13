@@ -61,6 +61,7 @@ const (
 	spreadIN3MADKRandomEnv     = "SPREAD_IN3_MADK_RANDOM"
 	spreadIN3MADKCloseEnv      = "SPREAD_IN3_MADK_CLOSE"
 	spreadIN3MinSamplesEnv     = "SPREAD_IN3_MIN_SAMPLES"
+	spreadAttackerPctsEnv      = "SPREAD_ATTACKER_PCTS"
 )
 
 type stringListFlag []string
@@ -72,34 +73,35 @@ func (s *stringListFlag) Set(v string) error {
 }
 
 type runConfig struct {
-	Nodes             int     `json:"nodes"`
-	Trials            int     `json:"trials"`
-	Seed              int     `json:"seed"`
-	WarmupEvery       int     `json:"warmup_every"`
-	WarmupPerPublish  int     `json:"warmup_rounds_per_publish"`
-	LinkMiBps         int     `json:"link_mibps"`
-	ScenarioTimeoutMs int     `json:"scenario_timeout_ms"`
-	SpreadClusterPct  float64 `json:"spread_cluster_pct"`
-	SpreadNumRings    int     `json:"spread_num_rings"`
-	SpreadIntraFanout int     `json:"spread_intra_fanout"`
-	SpreadInterFanout int     `json:"spread_inter_fanout"`
-	SpreadIntraRho    float64 `json:"spread_intra_rho"`
-	SpreadInterProb   float64 `json:"spread_inter_prob"`
-	SpreadFallback    int     `json:"spread_fallback_threshold"`
-	SpreadDupReprop   int     `json:"spread_duplicate_repropagation"`
-	SpreadUseAngular  bool    `json:"spread_use_angular_inter_peers"`
-	SpreadCC          float64 `json:"spread_cc"`
-	SpreadCE          float64 `json:"spread_ce"`
-	SpreadNewton      bool    `json:"spread_newton"`
-	SpreadOutlier     float64 `json:"spread_outlier_threshold"`
-	SpreadSamples     int     `json:"spread_samples"`
-	SpreadIntervalMS  int     `json:"spread_interval_ms"`
-	SpreadNeighborSet int     `json:"spread_neighbor_set_size"`
-	SpreadIN1MS       float64 `json:"spread_in1_threshold_ms"`
-	SpreadIN2MS       float64 `json:"spread_in2_threshold_ms"`
-	SpreadIN3Rand     float64 `json:"spread_in3_madk_random"`
-	SpreadIN3Close    float64 `json:"spread_in3_madk_close"`
-	SpreadIN3Min      int     `json:"spread_in3_min_samples"`
+	Nodes              int     `json:"nodes"`
+	Trials             int     `json:"trials"`
+	Seed               int     `json:"seed"`
+	WarmupEvery        int     `json:"warmup_every"`
+	WarmupPerPublish   int     `json:"warmup_rounds_per_publish"`
+	LinkMiBps          int     `json:"link_mibps"`
+	ScenarioTimeoutMs  int     `json:"scenario_timeout_ms"`
+	SpreadClusterPct   float64 `json:"spread_cluster_pct"`
+	SpreadNumRings     int     `json:"spread_num_rings"`
+	SpreadIntraFanout  int     `json:"spread_intra_fanout"`
+	SpreadInterFanout  int     `json:"spread_inter_fanout"`
+	SpreadIntraRho     float64 `json:"spread_intra_rho"`
+	SpreadInterProb    float64 `json:"spread_inter_prob"`
+	SpreadFallback     int     `json:"spread_fallback_threshold"`
+	SpreadDupReprop    int     `json:"spread_duplicate_repropagation"`
+	SpreadUseAngular   bool    `json:"spread_use_angular_inter_peers"`
+	SpreadCC           float64 `json:"spread_cc"`
+	SpreadCE           float64 `json:"spread_ce"`
+	SpreadNewton       bool    `json:"spread_newton"`
+	SpreadOutlier      float64 `json:"spread_outlier_threshold"`
+	SpreadSamples      int     `json:"spread_samples"`
+	SpreadIntervalMS   int     `json:"spread_interval_ms"`
+	SpreadNeighborSet  int     `json:"spread_neighbor_set_size"`
+	SpreadIN1MS        float64 `json:"spread_in1_threshold_ms"`
+	SpreadIN2MS        float64 `json:"spread_in2_threshold_ms"`
+	SpreadIN3Rand      float64 `json:"spread_in3_madk_random"`
+	SpreadIN3Close     float64 `json:"spread_in3_madk_close"`
+	SpreadIN3Min       int     `json:"spread_in3_min_samples"`
+	SpreadAttackerPcts string  `json:"spread_attacker_pcts"`
 }
 
 type runExport struct {
@@ -193,6 +195,7 @@ type spreadConfigYAML struct {
 	IN3MADKRandom          *float64 `yaml:"spread_in3_madk_random"`
 	IN3MADKClose           *float64 `yaml:"spread_in3_madk_close"`
 	IN3MinSamples          *int     `yaml:"spread_in3_min_samples"`
+	AttackerPcts           *string  `yaml:"spread_attacker_pcts"`
 }
 
 type executionOutcome struct {
@@ -525,6 +528,7 @@ func defaultFileConfig() fileConfig {
 	in3Random := 5.0
 	in3Close := 8.0
 	in3Min := 4
+	attackerPcts := ""
 
 	return fileConfig{
 		Batch: batchConfigYAML{
@@ -565,6 +569,7 @@ func defaultFileConfig() fileConfig {
 			IN3MADKRandom:          &in3Random,
 			IN3MADKClose:           &in3Close,
 			IN3MinSamples:          &in3Min,
+			AttackerPcts:           &attackerPcts,
 		},
 	}
 }
@@ -613,6 +618,7 @@ func validateConfig(cfg fileConfig) error {
 	require(cfg.Spread.IN3MADKRandom != nil, "spread.spread_in3_madk_random")
 	require(cfg.Spread.IN3MADKClose != nil, "spread.spread_in3_madk_close")
 	require(cfg.Spread.IN3MinSamples != nil, "spread.spread_in3_min_samples")
+	require(cfg.Spread.AttackerPcts != nil, "spread.spread_attacker_pcts")
 
 	if len(missing) > 0 {
 		return fmt.Errorf("config missing required keys: %s", strings.Join(missing, ", "))
@@ -653,6 +659,7 @@ func configToEnvMap(cfg fileConfig) map[string]string {
 		spreadIN3MADKRandomEnv:     fmt.Sprintf("%g", *cfg.Spread.IN3MADKRandom),
 		spreadIN3MADKCloseEnv:      fmt.Sprintf("%g", *cfg.Spread.IN3MADKClose),
 		spreadIN3MinSamplesEnv:     strconv.Itoa(*cfg.Spread.IN3MinSamples),
+		spreadAttackerPctsEnv:      *cfg.Spread.AttackerPcts,
 	}
 }
 
@@ -686,6 +693,7 @@ func configFromEnv(env map[string]string) runConfig {
 	cfg.SpreadIN3Rand = envFloatFromMap(env, spreadIN3MADKRandomEnv)
 	cfg.SpreadIN3Close = envFloatFromMap(env, spreadIN3MADKCloseEnv)
 	cfg.SpreadIN3Min = envIntFromMap(env, spreadIN3MinSamplesEnv)
+	cfg.SpreadAttackerPcts = env[spreadAttackerPctsEnv]
 	return cfg
 }
 

@@ -14,7 +14,9 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -63,6 +65,7 @@ const (
 	SPREAD_IN3_MADK_RANDOM         = "SPREAD_IN3_MADK_RANDOM"
 	SPREAD_IN3_MADK_CLOSE          = "SPREAD_IN3_MADK_CLOSE"
 	SPREAD_IN3_MIN_SAMPLES         = "SPREAD_IN3_MIN_SAMPLES"
+	SPREAD_ATTACKER_PCTS           = "SPREAD_ATTACKER_PCTS"
 )
 
 type delivery struct {
@@ -72,13 +75,38 @@ type delivery struct {
 }
 
 type trialResult struct {
-	Trial      int        `json:"trial"`
-	Src        int        `json:"src"`        // original node ID from nodes.json
-	Deliveries []delivery `json:"deliveries"` // one per receiver
+	Trial             int                `json:"trial"`
+	Src               int                `json:"src"` // original node ID from nodes.json
+	Deliveries        []delivery         `json:"deliveries"`
+	FirstReceipts     []firstReceipt     `json:"first_receipts,omitempty"`
+	AttackerEstimates []attackerEstimate `json:"attacker_estimates,omitempty"`
+}
+
+type firstReceipt struct {
+	Node            int     `json:"node"`              // receiver node ID
+	FirstFrom       int     `json:"first_from"`        // node ID that first delivered to receiver
+	ReceivedDelayMS float64 `json:"received_delay_ms"` // elapsed since publish
+}
+
+type attackerEstimate struct {
+	AttackerPct        float64 `json:"attacker_pct"`
+	AttackerCount      int     `json:"attacker_count"`
+	EstimatedSource    int     `json:"estimated_source"`
+	TrueSource         int     `json:"true_source"`
+	IsCorrect          bool    `json:"is_correct"`
+	ObservedByAttacker int     `json:"observed_by_attacker"`
+	ObservedDelayMS    float64 `json:"observed_delay_ms"`
 }
 
 type experimentResult struct {
 	trials []trialResult
+}
+
+type attackerAccuracySummary struct {
+	AttackerPct      float64 `json:"attacker_pct"`
+	TrialsObserved   int     `json:"trials_observed"`
+	CorrectEstimates int     `json:"correct_estimates"`
+	Accuracy         float64 `json:"accuracy"`
 }
 
 type experimentTopology struct {
@@ -105,6 +133,9 @@ type spreadExperimentExport struct {
 
 	Gossipsub []trialResult `json:"gossipsub"`
 	Spread    []trialResult `json:"spread"`
+
+	GossipsubAttackerAccuracy []attackerAccuracySummary `json:"gossipsub_attacker_accuracy,omitempty"`
+	SpreadAttackerAccuracy    []attackerAccuracySummary `json:"spread_attacker_accuracy,omitempty"`
 }
 
 func TestSimnetSpreadVsGossipsubLatencyStretch(t *testing.T) {
@@ -228,6 +259,12 @@ func runScenario(t *testing.T, topo experimentTopology, cfg scenarioConfig) expe
 	res := experimentResult{
 		trials: make([]trialResult, 0, cfg.trials),
 	}
+	peerIndexByID := make(map[peer.ID]int, len(topo.hosts))
+	for i, h := range topo.hosts {
+		peerIndexByID[h.ID()] = i
+	}
+	attackerPcts := attackerPercentsFromEnv()
+	rng := rand.New(rand.NewSource(int64(envInt("SPREAD_SIMNET_SEED", SPREAD_SIMNET_SEED) + 7919)))
 
 	// Run trials
 	for trial := 0; trial < cfg.trials; trial++ {
@@ -250,7 +287,7 @@ func runScenario(t *testing.T, topo experimentTopology, cfg scenarioConfig) expe
 			if i == src {
 				continue
 			}
-			go waitForMessage(ctx, i, subs[i], payload, out)
+			go waitForMessage(ctx, i, subs[i], payload, peerIndexByID, out)
 		}
 
 		// Start the timer right before publish
@@ -266,10 +303,16 @@ func runScenario(t *testing.T, topo experimentTopology, cfg scenarioConfig) expe
 		}
 
 		tr := trialResult{
-			Trial:      trial,
-			Src:        topo.nodeIDs[src],
-			Deliveries: make([]delivery, 0, len(psubs)-1),
+			Trial:         trial,
+			Src:           topo.nodeIDs[src],
+			Deliveries:    make([]delivery, 0, len(psubs)-1),
+			FirstReceipts: make([]firstReceipt, 0, len(psubs)),
 		}
+		tr.FirstReceipts = append(tr.FirstReceipts, firstReceipt{
+			Node:            topo.nodeIDs[src],
+			FirstFrom:       topo.nodeIDs[src],
+			ReceivedDelayMS: 0,
+		})
 
 		// Wait for all subscribers to receive the message and collect results
 		for i := 0; i < len(psubs)-1; i++ {
@@ -292,7 +335,16 @@ func runScenario(t *testing.T, topo experimentTopology, cfg scenarioConfig) expe
 				LatencyMS: obsMS,
 				Stretch:   st,
 			})
+			tr.FirstReceipts = append(tr.FirstReceipts, firstReceipt{
+				Node:            topo.nodeIDs[rr.idx],
+				FirstFrom:       topo.nodeIDs[rr.fromIdx],
+				ReceivedDelayMS: obsMS,
+			})
 		}
+		sort.Slice(tr.FirstReceipts, func(i, j int) bool {
+			return tr.FirstReceipts[i].Node < tr.FirstReceipts[j].Node
+		})
+		tr.AttackerEstimates = estimateSourceFromAttackers(tr.FirstReceipts, topo.nodeIDs, src, attackerPcts, rng)
 
 		res.trials = append(res.trials, tr)
 	}
@@ -300,13 +352,94 @@ func runScenario(t *testing.T, topo experimentTopology, cfg scenarioConfig) expe
 	return res
 }
 
-type recvResult struct {
-	idx int // index of the receiving peer
-	at  time.Time
-	err error
+func attackerPercentsFromEnv() []float64 {
+	raw := strings.TrimSpace(os.Getenv(SPREAD_ATTACKER_PCTS))
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]float64, 0, len(parts))
+	for _, part := range parts {
+		p, err := strconv.ParseFloat(strings.TrimSpace(part), 64)
+		if err != nil {
+			continue
+		}
+		if p <= 0 || p > 1 {
+			continue
+		}
+		out = append(out, p)
+	}
+	sort.Float64s(out)
+	return out
 }
 
-func waitForMessage(ctx context.Context, idx int, sub *Subscription, payload []byte, out chan<- recvResult) {
+func estimateSourceFromAttackers(firstReceipts []firstReceipt, nodeIDs []int, srcIdx int, attackerPcts []float64, rng *rand.Rand) []attackerEstimate {
+	if len(attackerPcts) == 0 {
+		return nil
+	}
+	receiptsByNode := make(map[int]firstReceipt, len(firstReceipts))
+	for _, fr := range firstReceipts {
+		receiptsByNode[fr.Node] = fr
+	}
+	candidates := make([]int, 0, len(nodeIDs)-1)
+	for i, nid := range nodeIDs {
+		if i == srcIdx {
+			continue
+		}
+		candidates = append(candidates, nid)
+	}
+	if len(candidates) == 0 {
+		return nil
+	}
+	perm := append([]int(nil), candidates...)
+	rng.Shuffle(len(perm), func(i, j int) {
+		perm[i], perm[j] = perm[j], perm[i]
+	})
+	estimates := make([]attackerEstimate, 0, len(attackerPcts))
+	for _, pct := range attackerPcts {
+		attackers := int(math.Ceil(pct * float64(len(candidates))))
+		if attackers < 1 {
+			attackers = 1
+		}
+		if attackers > len(candidates) {
+			attackers = len(candidates)
+		}
+		bestFound := false
+		var best firstReceipt
+		for _, attackerNode := range perm[:attackers] {
+			fr, ok := receiptsByNode[attackerNode]
+			if !ok {
+				continue
+			}
+			if !bestFound || fr.ReceivedDelayMS < best.ReceivedDelayMS {
+				best = fr
+				bestFound = true
+			}
+		}
+		if !bestFound {
+			continue
+		}
+		estimates = append(estimates, attackerEstimate{
+			AttackerPct:        pct,
+			AttackerCount:      attackers,
+			EstimatedSource:    best.FirstFrom,
+			TrueSource:         nodeIDs[srcIdx],
+			IsCorrect:          best.FirstFrom == nodeIDs[srcIdx],
+			ObservedByAttacker: best.Node,
+			ObservedDelayMS:    best.ReceivedDelayMS,
+		})
+	}
+	return estimates
+}
+
+type recvResult struct {
+	idx     int // index of the receiving peer
+	fromIdx int // index of the peer that first delivered this message
+	at      time.Time
+	err     error
+}
+
+func waitForMessage(ctx context.Context, idx int, sub *Subscription, payload []byte, peerIndexByID map[peer.ID]int, out chan<- recvResult) {
 	for {
 		msg, err := sub.Next(ctx)
 		at := time.Now()
@@ -318,7 +451,12 @@ func waitForMessage(ctx context.Context, idx int, sub *Subscription, payload []b
 		if !bytes.Equal(msg.Data, payload) {
 			continue
 		}
-		out <- recvResult{idx: idx, at: at}
+		fromIdx, ok := peerIndexByID[msg.ReceivedFrom]
+		if !ok {
+			out <- recvResult{err: fmt.Errorf("receiver %d: unknown ReceivedFrom peer %s", idx, msg.ReceivedFrom)}
+			return
+		}
+		out <- recvResult{idx: idx, fromIdx: fromIdx, at: at}
 		return
 	}
 }
@@ -556,18 +694,64 @@ func makeEthereumLikeLatencyMatrix(t *testing.T, n int, seed int64) ([][]time.Du
 
 func buildSpreadExperimentExport(gsRes, spreadRes experimentResult, nodeIDs []int, nodeCount, trials, seed int) spreadExperimentExport {
 	return spreadExperimentExport{
-		GeneratedAt:       time.Now().UTC().Format(time.RFC3339Nano),
-		Nodes:             nodeCount,
-		Trials:            trials,
-		Seed:              seed,
-		WarmupEvery:       envInt("SPREAD_SIMNET_WARMUP_EVERY", SPREAD_SIMNET_WARMUP_EVERY),
-		WarmupPerPublish:  envInt("SPREAD_SIMNET_WARMUP_ROUNDS_PER_PUBLISH", SPREAD_SIMNET_WARMUP_ROUNDS_PER_PUBLISH),
-		LinkMiBps:         envInt("SPREAD_SIMNET_LINK_MIBPS", SPREAD_SIMNET_LINK_MIBPS),
-		ScenarioTimeoutMs: int(SPREAD_SIMNET_SCENARIO_TIMEOUT / time.Millisecond),
-		NodeIDs:           nodeIDs,
-		Gossipsub:         gsRes.trials,
-		Spread:            spreadRes.trials,
+		GeneratedAt:               time.Now().UTC().Format(time.RFC3339Nano),
+		Nodes:                     nodeCount,
+		Trials:                    trials,
+		Seed:                      seed,
+		WarmupEvery:               envInt("SPREAD_SIMNET_WARMUP_EVERY", SPREAD_SIMNET_WARMUP_EVERY),
+		WarmupPerPublish:          envInt("SPREAD_SIMNET_WARMUP_ROUNDS_PER_PUBLISH", SPREAD_SIMNET_WARMUP_ROUNDS_PER_PUBLISH),
+		LinkMiBps:                 envInt("SPREAD_SIMNET_LINK_MIBPS", SPREAD_SIMNET_LINK_MIBPS),
+		ScenarioTimeoutMs:         int(SPREAD_SIMNET_SCENARIO_TIMEOUT / time.Millisecond),
+		NodeIDs:                   nodeIDs,
+		Gossipsub:                 gsRes.trials,
+		Spread:                    spreadRes.trials,
+		GossipsubAttackerAccuracy: summarizeAttackerAccuracy(gsRes),
+		SpreadAttackerAccuracy:    summarizeAttackerAccuracy(spreadRes),
 	}
+}
+
+func summarizeAttackerAccuracy(res experimentResult) []attackerAccuracySummary {
+	type tally struct {
+		trials  int
+		correct int
+	}
+	byPct := make(map[float64]*tally)
+	for _, tr := range res.trials {
+		for _, est := range tr.AttackerEstimates {
+			t := byPct[est.AttackerPct]
+			if t == nil {
+				t = &tally{}
+				byPct[est.AttackerPct] = t
+			}
+			t.trials++
+			if est.IsCorrect {
+				t.correct++
+			}
+		}
+	}
+	if len(byPct) == 0 {
+		return nil
+	}
+	pcts := make([]float64, 0, len(byPct))
+	for pct := range byPct {
+		pcts = append(pcts, pct)
+	}
+	sort.Float64s(pcts)
+	out := make([]attackerAccuracySummary, 0, len(pcts))
+	for _, pct := range pcts {
+		t := byPct[pct]
+		acc := 0.0
+		if t.trials > 0 {
+			acc = float64(t.correct) / float64(t.trials)
+		}
+		out = append(out, attackerAccuracySummary{
+			AttackerPct:      pct,
+			TrialsObserved:   t.trials,
+			CorrectEstimates: t.correct,
+			Accuracy:         acc,
+		})
+	}
+	return out
 }
 
 func writeSpreadExperimentExport(path string, doc spreadExperimentExport) error {
