@@ -97,6 +97,7 @@ Notes:
 - Directory is created automatically if it does not exist.
 - Resume uses `checkpoint.json` + existing `results.jsonl`.
 - `received_delay_ms` is measured from the publish time (oracle latency for experimentation).
+- Crash experiment: if enabled, a random `crash_pct` fraction of nodes is crashed after peering and before dissemination; trials run only among survivors.
 
 
 ## Plot Results

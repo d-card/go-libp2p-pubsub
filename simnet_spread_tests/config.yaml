@@ -9,6 +9,8 @@ simnet:
   spread_simnet_nodes: 30
   spread_simnet_trials: 50
   spread_simnet_seed: 1337
+  spread_simnet_enable_crash: false
+  spread_simnet_crash_pct: 0.0 # set 0.05 or 0.10 for 5%/10% crash experiment
   spread_simnet_warmup_every: 0
   spread_simnet_warmup_rounds_per_publish: 1
   spread_simnet_link_mibps: 20

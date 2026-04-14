@@ -34,6 +34,8 @@ const (
 	SPREAD_SIMNET_EXPORT_PATH_ENV           = "SPREAD_SIMNET_EXPORT_PATH"
 	SPREAD_SIMNET_RUN_ID_ENV                = "SPREAD_SIMNET_RUN_ID"
 	SPREAD_SIMNET_GIT_COMMIT_ENV            = "SPREAD_SIMNET_GIT_COMMIT"
+	SPREAD_SIMNET_ENABLE_CRASH_ENV          = "SPREAD_SIMNET_ENABLE_CRASH"
+	SPREAD_SIMNET_CRASH_PCT_ENV             = "SPREAD_SIMNET_CRASH_PCT"
 	SPREAD_SIMNET_NODES                     = 20               // Number of nodes
 	SPREAD_SIMNET_TRIALS                    = 500              // Number of messages published
 	SPREAD_SIMNET_WARMUP_EVERY              = 0                // Number of trials between warm-up rounds of vivaldi
@@ -155,6 +157,8 @@ func TestSimnetSpreadVsGossipsubLatencyStretch(t *testing.T) {
 		useSpread:        false,
 		warmupEvery:      0,
 		warmupPerPublish: 0,
+		enableCrash:      envBool(SPREAD_SIMNET_ENABLE_CRASH_ENV, false),
+		crashPct:         envFloat(SPREAD_SIMNET_CRASH_PCT_ENV, 0),
 	})
 	t.Logf("gossipsub: %d trials completed in %s", trials, time.Since(gossipsubStartTime))
 
@@ -168,6 +172,8 @@ func TestSimnetSpreadVsGossipsubLatencyStretch(t *testing.T) {
 		useSpread:        true,
 		warmupEvery:      envInt("SPREAD_SIMNET_WARMUP_EVERY", SPREAD_SIMNET_WARMUP_EVERY),
 		warmupPerPublish: envInt("SPREAD_SIMNET_WARMUP_ROUNDS_PER_PUBLISH", SPREAD_SIMNET_WARMUP_ROUNDS_PER_PUBLISH),
+		enableCrash:      envBool(SPREAD_SIMNET_ENABLE_CRASH_ENV, false),
+		crashPct:         envFloat(SPREAD_SIMNET_CRASH_PCT_ENV, 0),
 	})
 	t.Logf("spread: %d trials completed in %s", trials, time.Since(spreadStartTime))
 
@@ -195,6 +201,8 @@ type scenarioConfig struct {
 	useSpread        bool
 	warmupEvery      int
 	warmupPerPublish int
+	enableCrash      bool
+	crashPct         float64
 }
 
 func runScenario(t *testing.T, topo experimentTopology, cfg scenarioConfig) experimentResult {
@@ -256,6 +264,41 @@ func runScenario(t *testing.T, topo experimentTopology, cfg scenarioConfig) expe
 
 	time.Sleep(2 * time.Second)
 
+	alive := make([]int, 0, len(psubs))
+	for i := range psubs {
+		alive = append(alive, i)
+	}
+	if cfg.enableCrash && cfg.crashPct > 0 {
+		if cfg.crashPct > 1 {
+			t.Fatalf("%s: crash pct must be in [0,1], got %.4f", cfg.name, cfg.crashPct)
+		}
+		crashCount := int(math.Ceil(cfg.crashPct * float64(len(psubs))))
+		if crashCount >= len(psubs) {
+			crashCount = len(psubs) - 1
+		}
+		if crashCount > 0 {
+			rngCrash := rand.New(rand.NewSource(int64(envInt("SPREAD_SIMNET_SEED", SPREAD_SIMNET_SEED) + 2027)))
+			perm := rngCrash.Perm(len(psubs))
+			crashed := make(map[int]struct{}, crashCount)
+			for _, idx := range perm[:crashCount] {
+				crashed[idx] = struct{}{}
+				_ = topics[idx].Close()
+				_ = subs[idx].Cancel()
+				_ = topo.hosts[idx].Close()
+			}
+			alive = alive[:0]
+			for i := range psubs {
+				if _, ok := crashed[i]; !ok {
+					alive = append(alive, i)
+				}
+			}
+			t.Logf("%s: crashed %d/%d nodes before dissemination (%.2f%%), alive=%d", cfg.name, crashCount, len(psubs), cfg.crashPct*100, len(alive))
+		}
+	}
+	if len(alive) < 2 {
+		t.Fatalf("%s: not enough alive nodes after crashes: %d", cfg.name, len(alive))
+	}
+
 	res := experimentResult{
 		trials: make([]trialResult, 0, cfg.trials),
 	}
@@ -276,14 +319,15 @@ func runScenario(t *testing.T, topo experimentTopology, cfg scenarioConfig) expe
 		}
 
 		// Select source node for this trial
-		src := trial % len(psubs)
+		src := alive[trial%len(alive)]
 		// Sample payload
 		payload := []byte(fmt.Sprintf("%s-msg-%d", cfg.name, trial))
 		// Channel to receive results from subscribers
-		out := make(chan recvResult, len(psubs)-1)
+		expectedReceivers := len(alive) - 1
+		out := make(chan recvResult, expectedReceivers)
 
 		// Start waiting for messages on all subscribers in parallel, except the source
-		for i := range psubs {
+		for _, i := range alive {
 			if i == src {
 				continue
 			}
@@ -305,8 +349,8 @@ func runScenario(t *testing.T, topo experimentTopology, cfg scenarioConfig) expe
 		tr := trialResult{
 			Trial:         trial,
 			Src:           topo.nodeIDs[src],
-			Deliveries:    make([]delivery, 0, len(psubs)-1),
-			FirstReceipts: make([]firstReceipt, 0, len(psubs)),
+			Deliveries:    make([]delivery, 0, expectedReceivers),
+			FirstReceipts: make([]firstReceipt, 0, len(alive)),
 		}
 		tr.FirstReceipts = append(tr.FirstReceipts, firstReceipt{
 			Node:            topo.nodeIDs[src],
@@ -315,7 +359,7 @@ func runScenario(t *testing.T, topo experimentTopology, cfg scenarioConfig) expe
 		})
 
 		// Wait for all subscribers to receive the message and collect results
-		for i := 0; i < len(psubs)-1; i++ {
+		for i := 0; i < expectedReceivers; i++ {
 			rr := <-out
 			if rr.err != nil {
 				t.Fatalf("%s: receive trial=%d source=%d: %v", cfg.name, trial, src, rr.err)

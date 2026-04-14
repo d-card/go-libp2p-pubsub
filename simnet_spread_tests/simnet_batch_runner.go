@@ -36,6 +36,8 @@ const (
 	spreadNodesEnv             = "SPREAD_SIMNET_NODES"
 	spreadTrialsEnv            = "SPREAD_SIMNET_TRIALS"
 	spreadSeedEnv              = "SPREAD_SIMNET_SEED"
+	spreadEnableCrashEnv       = "SPREAD_SIMNET_ENABLE_CRASH"
+	spreadCrashPctEnv          = "SPREAD_SIMNET_CRASH_PCT"
 	spreadWarmupEveryEnv       = "SPREAD_SIMNET_WARMUP_EVERY"
 	spreadWarmupRoundsEnv      = "SPREAD_SIMNET_WARMUP_ROUNDS_PER_PUBLISH"
 	spreadLinkMibpsEnv         = "SPREAD_SIMNET_LINK_MIBPS"
@@ -76,6 +78,8 @@ type runConfig struct {
 	Nodes              int     `json:"nodes"`
 	Trials             int     `json:"trials"`
 	Seed               int     `json:"seed"`
+	EnableCrash        bool    `json:"enable_crash"`
+	CrashPct           float64 `json:"crash_pct"`
 	WarmupEvery        int     `json:"warmup_every"`
 	WarmupPerPublish   int     `json:"warmup_rounds_per_publish"`
 	LinkMiBps          int     `json:"link_mibps"`
@@ -164,13 +168,15 @@ type batchConfigYAML struct {
 }
 
 type simnetConfigYAML struct {
-	Nodes                  *int `yaml:"spread_simnet_nodes"`
-	Trials                 *int `yaml:"spread_simnet_trials"`
-	Seed                   *int `yaml:"spread_simnet_seed"`
-	WarmupEvery            *int `yaml:"spread_simnet_warmup_every"`
-	WarmupRoundsPerPublish *int `yaml:"spread_simnet_warmup_rounds_per_publish"`
-	LinkMibps              *int `yaml:"spread_simnet_link_mibps"`
-	ScenarioTimeoutMS      *int `yaml:"spread_simnet_scenario_timeout_ms"`
+	Nodes                  *int     `yaml:"spread_simnet_nodes"`
+	Trials                 *int     `yaml:"spread_simnet_trials"`
+	Seed                   *int     `yaml:"spread_simnet_seed"`
+	EnableCrash            *bool    `yaml:"spread_simnet_enable_crash"`
+	CrashPct               *float64 `yaml:"spread_simnet_crash_pct"`
+	WarmupEvery            *int     `yaml:"spread_simnet_warmup_every"`
+	WarmupRoundsPerPublish *int     `yaml:"spread_simnet_warmup_rounds_per_publish"`
+	LinkMibps              *int     `yaml:"spread_simnet_link_mibps"`
+	ScenarioTimeoutMS      *int     `yaml:"spread_simnet_scenario_timeout_ms"`
 }
 
 type spreadConfigYAML struct {
@@ -502,6 +508,8 @@ func defaultFileConfig() fileConfig {
 	nodes := 20
 	trials := 500
 	seed := 1337
+	enableCrash := false
+	crashPct := 0.0
 	warmupEvery := 0
 	warmupRounds := 1
 	linkMibps := 20
@@ -542,6 +550,8 @@ func defaultFileConfig() fileConfig {
 			Nodes:                  &nodes,
 			Trials:                 &trials,
 			Seed:                   &seed,
+			EnableCrash:            &enableCrash,
+			CrashPct:               &crashPct,
 			WarmupEvery:            &warmupEvery,
 			WarmupRoundsPerPublish: &warmupRounds,
 			LinkMibps:              &linkMibps,
@@ -592,6 +602,8 @@ func validateConfig(cfg fileConfig) error {
 	require(cfg.Simnet.Nodes != nil, "simnet.spread_simnet_nodes")
 	require(cfg.Simnet.Trials != nil, "simnet.spread_simnet_trials")
 	require(cfg.Simnet.Seed != nil, "simnet.spread_simnet_seed")
+	require(cfg.Simnet.EnableCrash != nil, "simnet.spread_simnet_enable_crash")
+	require(cfg.Simnet.CrashPct != nil, "simnet.spread_simnet_crash_pct")
 	require(cfg.Simnet.WarmupEvery != nil, "simnet.spread_simnet_warmup_every")
 	require(cfg.Simnet.WarmupRoundsPerPublish != nil, "simnet.spread_simnet_warmup_rounds_per_publish")
 	require(cfg.Simnet.LinkMibps != nil, "simnet.spread_simnet_link_mibps")
@@ -626,6 +638,9 @@ func validateConfig(cfg fileConfig) error {
 	if _, err := time.ParseDuration(*cfg.Batch.PerRunTimeout); err != nil {
 		return fmt.Errorf("invalid batch.per_run_timeout: %w", err)
 	}
+	if *cfg.Simnet.CrashPct < 0 || *cfg.Simnet.CrashPct > 1 {
+		return fmt.Errorf("invalid simnet.spread_simnet_crash_pct: must be in [0,1], got %g", *cfg.Simnet.CrashPct)
+	}
 	return nil
 }
 
@@ -634,6 +649,8 @@ func configToEnvMap(cfg fileConfig) map[string]string {
 		spreadNodesEnv:             strconv.Itoa(*cfg.Simnet.Nodes),
 		spreadTrialsEnv:            strconv.Itoa(*cfg.Simnet.Trials),
 		spreadSeedEnv:              strconv.Itoa(*cfg.Simnet.Seed),
+		spreadEnableCrashEnv:       strconv.FormatBool(*cfg.Simnet.EnableCrash),
+		spreadCrashPctEnv:          fmt.Sprintf("%g", *cfg.Simnet.CrashPct),
 		spreadWarmupEveryEnv:       strconv.Itoa(*cfg.Simnet.WarmupEvery),
 		spreadWarmupRoundsEnv:      strconv.Itoa(*cfg.Simnet.WarmupRoundsPerPublish),
 		spreadLinkMibpsEnv:         strconv.Itoa(*cfg.Simnet.LinkMibps),
@@ -668,6 +685,8 @@ func configFromEnv(env map[string]string) runConfig {
 	cfg.Nodes = envIntFromMap(env, spreadNodesEnv)
 	cfg.Trials = envIntFromMap(env, spreadTrialsEnv)
 	cfg.Seed = envIntFromMap(env, spreadSeedEnv)
+	cfg.EnableCrash = envBoolFromMap(env, spreadEnableCrashEnv)
+	cfg.CrashPct = envFloatFromMap(env, spreadCrashPctEnv)
 	cfg.WarmupEvery = envIntFromMap(env, spreadWarmupEveryEnv)
 	cfg.WarmupPerPublish = envIntFromMap(env, spreadWarmupRoundsEnv)
 	cfg.LinkMiBps = envIntFromMap(env, spreadLinkMibpsEnv)
