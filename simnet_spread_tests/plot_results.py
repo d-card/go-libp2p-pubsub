@@ -174,7 +174,7 @@ def savefig(fig, out_dir: str, name: str):
 
 # -- Scatter helpers --------------------------------------------------------
 
-def _scatter_gs_vs_spread(ax, gs_vals, sp_vals, colors, markers, labels, title, xlabel, ylabel):
+def _scatter_gs_vs_spread(ax, gs_vals, sp_vals, colors, markers, labels, title, xlabel, ylabel, point_size=50):
     """Draw GossipSub (X) vs Spread (Y) scatter with x=y line."""
     g_arr = np.asarray(gs_vals, dtype=float)
     s_arr = np.asarray(sp_vals, dtype=float)
@@ -200,7 +200,7 @@ def _scatter_gs_vs_spread(ax, gs_vals, sp_vals, colors, markers, labels, title, 
         c = colors_arr[idx]
         m = markers_arr[idx]
         ax.scatter(
-            g_arr[mask], s_arr[mask], color=c, marker=m, s=50, zorder=3,
+            g_arr[mask], s_arr[mask], color=c, marker=m, s=point_size, zorder=3,
             label=str(lbl), edgecolors="white", linewidths=0.4, alpha=0.7,
         )
 
@@ -264,7 +264,7 @@ def chart_per_pair_scatter(pair_stats, out_dir, group_by):
             ax.set_visible(False)
             continue
         _scatter_gs_vs_spread(ax, gs_v, sp_v, cs, ms, ls,
-                              f"Per-pair {label}", f"GossipSub {label}", f"Spread {label}")
+                              f"Per-pair {label}", f"GossipSub {label}", f"Spread {label}", point_size=5)
     fig.suptitle("Per-pair: GossipSub vs Spread (color = N)", fontsize=14, y=1.01)
     fig.tight_layout()
     savefig(fig, out_dir, "01_per_pair_scatter_by_n.png")
@@ -278,7 +278,7 @@ def chart_per_pair_scatter(pair_stats, out_dir, group_by):
                 ax.set_visible(False)
                 continue
             _scatter_gs_vs_spread(ax, gs_v, sp_v, cs, ms, ls,
-                                  f"Per-pair {label}", f"GossipSub {label}", f"Spread {label}")
+                                  f"Per-pair {label}", f"GossipSub {label}", f"Spread {label}", point_size=24)
         fig.suptitle("Per-pair: GossipSub vs Spread (color = seed)", fontsize=14, y=1.01)
         fig.tight_layout()
         savefig(fig, out_dir, "02_per_pair_scatter_by_seed.png")
@@ -317,62 +317,155 @@ def chart_per_topology_scatter(topo_stats, out_dir):
 
 # -- CDF charts ------------------------------------------------------------
 
-def _cdf_plot(ax, gs_vals, sp_vals, title, xlabel):
+def _resolve_cdf_xlim(gs_vals, sp_vals, lower_q, upper_q):
+    vals = np.concatenate([np.asarray(gs_vals, dtype=float), np.asarray(sp_vals, dtype=float)])
+    vals = vals[np.isfinite(vals)]
+    if vals.size == 0:
+        return None
+    lo = float(np.quantile(vals, lower_q))
+    hi = float(np.quantile(vals, upper_q))
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        return None
+    return (lo, hi)
+
+
+def _cdf_plot(ax, gs_vals, sp_vals, title, xlabel, xlim=None):
     """CDF comparison on a given axes."""
     for vals, proto in [(gs_vals, "gossipsub"), (sp_vals, "spread")]:
         sorted_v = np.sort(vals)
         cdf = np.arange(1, len(sorted_v) + 1) / len(sorted_v)
         ax.plot(sorted_v, cdf, color=PROTOCOL_COLORS[proto],
                 label=PROTOCOL_LABELS[proto], linewidth=1.5)
+    if xlim is not None:
+        ax.set_xlim(*xlim)
     ax.set_xlabel(xlabel)
     ax.set_ylabel("CDF")
     ax.set_title(title)
     ax.legend(fontsize=8)
 
 
-def chart_cdf_per_pair(pair_stats, out_dir):
+def chart_cdf_per_pair(pair_stats, out_dir, cdf_zoom=None):
     """CDF of per-pair aggregated stats: latency mean and stretch mean."""
     gs = pair_stats[pair_stats["protocol"] == "gossipsub"]
     sp = pair_stats[pair_stats["protocol"] == "spread"]
 
+    lat_xlim = None
+    st_xlim = None
+    if cdf_zoom is not None:
+        lower_q, upper_q = cdf_zoom
+        lat_xlim = _resolve_cdf_xlim(gs["latency_mean"].values, sp["latency_mean"].values, lower_q, upper_q)
+        st_xlim = _resolve_cdf_xlim(gs["stretch_mean"].values, sp["stretch_mean"].values, lower_q, upper_q)
+
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
     _cdf_plot(axes[0], gs["latency_mean"].values, sp["latency_mean"].values,
-              "CDF of Per-pair Mean Latency", "Mean latency (ms)")
+              "CDF of Per-pair Mean Latency", "Mean latency (ms)", xlim=lat_xlim)
     _cdf_plot(axes[1], gs["stretch_mean"].values, sp["stretch_mean"].values,
-              "CDF of Per-pair Mean Stretch", "Mean stretch")
+              "CDF of Per-pair Mean Stretch", "Mean stretch", xlim=st_xlim)
     fig.suptitle("Per-pair CDF", fontsize=13)
     fig.tight_layout()
     savefig(fig, out_dir, "04_cdf_per_pair.png")
 
 
-def chart_cdf_per_topology(topo_stats, out_dir):
+def chart_cdf_per_topology(topo_stats, out_dir, cdf_zoom=None):
     """CDF of per-topology aggregated stats: latency mean and stretch mean."""
     gs = topo_stats[topo_stats["protocol"] == "gossipsub"]
     sp = topo_stats[topo_stats["protocol"] == "spread"]
 
+    lat_xlim = None
+    st_xlim = None
+    if cdf_zoom is not None:
+        lower_q, upper_q = cdf_zoom
+        lat_xlim = _resolve_cdf_xlim(gs["latency_mean"].values, sp["latency_mean"].values, lower_q, upper_q)
+        st_xlim = _resolve_cdf_xlim(gs["stretch_mean"].values, sp["stretch_mean"].values, lower_q, upper_q)
+
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
     _cdf_plot(axes[0], gs["latency_mean"].values, sp["latency_mean"].values,
-              "CDF of Per-topology Mean Latency", "Mean latency (ms)")
+              "CDF of Per-topology Mean Latency", "Mean latency (ms)", xlim=lat_xlim)
     _cdf_plot(axes[1], gs["stretch_mean"].values, sp["stretch_mean"].values,
-              "CDF of Per-topology Mean Stretch", "Mean stretch")
+              "CDF of Per-topology Mean Stretch", "Mean stretch", xlim=st_xlim)
     fig.suptitle("Per-topology CDF", fontsize=13)
     fig.tight_layout()
     savefig(fig, out_dir, "05_cdf_per_topology.png")
 
 
-def chart_cdf_raw(df, out_dir):
+def chart_cdf_raw(df, out_dir, cdf_zoom=None):
     """CDF of raw observations: latency and stretch."""
     gs = df[df["protocol"] == "gossipsub"]
     sp = df[df["protocol"] == "spread"]
 
+    lat_xlim = None
+    st_xlim = None
+    if cdf_zoom is not None:
+        lower_q, upper_q = cdf_zoom
+        lat_xlim = _resolve_cdf_xlim(gs["latency_ms"].values, sp["latency_ms"].values, lower_q, upper_q)
+        st_xlim = _resolve_cdf_xlim(gs["stretch"].values, sp["stretch"].values, lower_q, upper_q)
+
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
     _cdf_plot(axes[0], gs["latency_ms"].values, sp["latency_ms"].values,
-              "CDF of Raw Latency", "Latency (ms)")
+              "CDF of Raw Latency", "Latency (ms)", xlim=lat_xlim)
     _cdf_plot(axes[1], gs["stretch"].values, sp["stretch"].values,
-              "CDF of Raw Stretch", "Stretch")
+              "CDF of Raw Stretch", "Stretch", xlim=st_xlim)
     fig.suptitle("Raw observations CDF (all pairs, all trials)", fontsize=13)
     fig.tight_layout()
     savefig(fig, out_dir, "06_cdf_raw.png")
+
+
+def chart_topology_delta_cdf(topo_stats, out_dir, cdf_zoom=None):
+    """
+    CDF of per-topology paired deltas:
+      delta = Spread - GossipSub (negative => Spread better for lower-is-better metrics).
+    """
+    keys = ["n"]
+    if "seed" in topo_stats.columns:
+        keys.append("seed")
+
+    gs = topo_stats[topo_stats["protocol"] == "gossipsub"]
+    sp = topo_stats[topo_stats["protocol"] == "spread"]
+    merged = gs.merge(sp, on=keys, suffixes=("_gs", "_sp"))
+    if merged.empty:
+        return
+
+    delta_latency = merged["latency_mean_sp"].values - merged["latency_mean_gs"].values
+    delta_stretch = merged["stretch_mean_sp"].values - merged["stretch_mean_gs"].values
+
+    lat_xlim = None
+    st_xlim = None
+    if cdf_zoom is not None:
+        lower_q, upper_q = cdf_zoom
+        # Zoom on absolute values, then map back to signed axis to preserve interpretation.
+        abs_lat = np.abs(delta_latency)
+        abs_st = np.abs(delta_stretch)
+        lat_abs_xlim = _resolve_cdf_xlim(abs_lat, abs_lat, lower_q, upper_q)
+        st_abs_xlim = _resolve_cdf_xlim(abs_st, abs_st, lower_q, upper_q)
+        if lat_abs_xlim is not None:
+            lat_xlim = (-lat_abs_xlim[1], lat_abs_xlim[1])
+        if st_abs_xlim is not None:
+            st_xlim = (-st_abs_xlim[1], st_abs_xlim[1])
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    _cdf_plot(
+        axes[0], delta_latency, delta_latency,
+        "CDF of Topology Delta Mean Latency (Spread - GossipSub)", "Delta latency (ms)", xlim=lat_xlim
+    )
+    axes[0].lines[1].set_visible(False)
+    axes[0].lines[0].set_color("#4c9e8e")
+    axes[0].lines[0].set_label("Delta (Spread - GossipSub)")
+    axes[0].axvline(0, color="black", linestyle="--", linewidth=1.2, alpha=0.8)
+    axes[0].legend(fontsize=8)
+
+    _cdf_plot(
+        axes[1], delta_stretch, delta_stretch,
+        "CDF of Topology Delta Mean Stretch (Spread - GossipSub)", "Delta stretch", xlim=st_xlim
+    )
+    axes[1].lines[1].set_visible(False)
+    axes[1].lines[0].set_color("#8e6ea0")
+    axes[1].lines[0].set_label("Delta (Spread - GossipSub)")
+    axes[1].axvline(0, color="black", linestyle="--", linewidth=1.2, alpha=0.8)
+    axes[1].legend(fontsize=8)
+
+    fig.suptitle("Per-topology Paired Delta CDF", fontsize=13)
+    fig.tight_layout()
+    savefig(fig, out_dir, "09_topology_delta_cdf.png")
 
 
 # -- Improvement heatmap ----------------------------------------------------
@@ -496,6 +589,116 @@ def chart_distributions(df, out_dir):
     savefig(fig, out_dir, "08_distributions.png")
 
 
+# -- Attacker accuracy charts -----------------------------------------------
+
+def _load_attacker_accuracy(exports: list) -> pd.DataFrame:
+    """
+    Extract attacker accuracy records from exports into a DataFrame with columns:
+        run_idx, n, seed, protocol, attacker_pct, trials_observed, correct_estimates, accuracy
+    """
+    rows = []
+    for run_idx, exp in enumerate(exports):
+        n = exp["nodes"]
+        seed = exp["seed"]
+        for proto, key in [("gossipsub", "gossipsub_attacker_accuracy"),
+                           ("spread", "spread_attacker_accuracy")]:
+            for rec in exp.get(key, []):
+                rows.append({
+                    "run_idx": run_idx,
+                    "n": n,
+                    "seed": seed,
+                    "protocol": proto,
+                    "attacker_pct": rec["attacker_pct"],
+                    "trials_observed": rec["trials_observed"],
+                    "correct_estimates": rec["correct_estimates"],
+                    "accuracy": rec["accuracy"],
+                })
+    return pd.DataFrame(rows)
+
+
+def chart_attacker_accuracy(exports: list, out_dir: str):
+    """
+    Grouped bar chart of attacker source-estimation accuracy per attacker
+    percentage, comparing GossipSub vs Spread.  When multiple N values or
+    seeds exist, bars show the mean accuracy with error bars (std).
+    """
+    acc_df = _load_attacker_accuracy(exports)
+    if acc_df.empty:
+        print("  (no attacker accuracy data found, skipping)")
+        return
+
+    agg = (
+        acc_df
+        .groupby(["protocol", "attacker_pct"])["accuracy"]
+        .agg(["mean", "std", "count"])
+        .reset_index()
+    )
+    agg["std"] = agg["std"].fillna(0)
+
+    pcts = sorted(agg["attacker_pct"].unique())
+    x = np.arange(len(pcts))
+    bar_w = 0.35
+
+    fig, ax = plt.subplots(figsize=(max(6, len(pcts) * 2.2), 5))
+    for i, proto in enumerate(["gossipsub", "spread"]):
+        sub = agg[agg["protocol"] == proto].set_index("attacker_pct")
+        means = [sub.loc[p, "mean"] if p in sub.index else 0 for p in pcts]
+        stds = [sub.loc[p, "std"] if p in sub.index else 0 for p in pcts]
+        ax.bar(
+            x + (i - 0.5) * bar_w, means, bar_w, yerr=stds,
+            color=PROTOCOL_COLORS[proto], label=PROTOCOL_LABELS[proto],
+            edgecolor="white", linewidth=0.6, capsize=4, alpha=0.85,
+        )
+
+    ax.set_xticks(x)
+    ax.set_xticklabels([f"{p*100:.0f}%" for p in pcts])
+    ax.set_xlabel("Attacker fraction")
+    ax.set_ylabel("Source-estimation accuracy")
+    ax.set_title("Attacker Source-Estimation Accuracy: GossipSub vs Spread")
+    ax.set_ylim(0, min(1.05, ax.get_ylim()[1] * 1.1))
+    ax.legend(fontsize=9)
+    fig.tight_layout()
+    savefig(fig, out_dir, "10_attacker_accuracy.png")
+
+    # Per-N breakdown when multiple N values exist
+    ns = sorted(acc_df["n"].unique())
+    if len(ns) > 1:
+        fig, axes_grid = plt.subplots(1, len(ns), figsize=(5 * len(ns), 5), sharey=True)
+        if len(ns) == 1:
+            axes_grid = [axes_grid]
+        for ax_i, (ax_n, n_val) in enumerate(zip(axes_grid, ns)):
+            sub_n = acc_df[acc_df["n"] == n_val]
+            agg_n = (
+                sub_n
+                .groupby(["protocol", "attacker_pct"])["accuracy"]
+                .agg(["mean", "std"])
+                .reset_index()
+            )
+            agg_n["std"] = agg_n["std"].fillna(0)
+            pcts_n = sorted(agg_n["attacker_pct"].unique())
+            x_n = np.arange(len(pcts_n))
+            for j, proto in enumerate(["gossipsub", "spread"]):
+                s = agg_n[agg_n["protocol"] == proto].set_index("attacker_pct")
+                m = [s.loc[p, "mean"] if p in s.index else 0 for p in pcts_n]
+                e = [s.loc[p, "std"] if p in s.index else 0 for p in pcts_n]
+                ax_n.bar(
+                    x_n + (j - 0.5) * bar_w, m, bar_w, yerr=e,
+                    color=PROTOCOL_COLORS[proto], label=PROTOCOL_LABELS[proto],
+                    edgecolor="white", linewidth=0.6, capsize=4, alpha=0.85,
+                )
+            ax_n.set_xticks(x_n)
+            ax_n.set_xticklabels([f"{p*100:.0f}%" for p in pcts_n])
+            ax_n.set_xlabel("Attacker fraction")
+            ax_n.set_title(f"N = {n_val}")
+            if ax_i == 0:
+                ax_n.set_ylabel("Source-estimation accuracy")
+                ax_n.legend(fontsize=8)
+            ax_n.set_ylim(0, 1.05)
+        fig.suptitle("Attacker Source-Estimation Accuracy by Network Size", fontsize=13)
+        fig.tight_layout()
+        savefig(fig, out_dir, "11_attacker_accuracy_by_n.png")
+
+
 # -- Main -------------------------------------------------------------------
 
 def main():
@@ -523,7 +726,18 @@ def main():
         "--group-by", choices=["n_seed", "n"], default="n_seed",
         help="Grouping for per-pair/per-topology stats: n_seed (default) or n",
     )
+    parser.add_argument(
+        "--cdf-x-lower-q", type=float, default=0.0,
+        help="Lower quantile for CDF x-axis zoom (default: 0.0, no lower crop)",
+    )
+    parser.add_argument(
+        "--cdf-x-upper-q", type=float, default=1.0,
+        help="Upper quantile for CDF x-axis zoom (default: 1.0, no upper crop)",
+    )
     args = parser.parse_args()
+    if not (0.0 <= args.cdf_x_lower_q < args.cdf_x_upper_q <= 1.0):
+        print("Invalid CDF x-axis quantiles: require 0 <= lower < upper <= 1.", file=sys.stderr)
+        sys.exit(2)
 
     os.makedirs(args.out, exist_ok=True)
 
@@ -544,6 +758,10 @@ def main():
     print(f"  Seeds: {sorted(df['seed'].unique())}")
 
     group_by = args.group_by
+    cdf_zoom = None
+    if args.cdf_x_lower_q > 0.0 or args.cdf_x_upper_q < 1.0:
+        cdf_zoom = (args.cdf_x_lower_q, args.cdf_x_upper_q)
+        print(f"CDF x-axis zoom quantiles: lower={args.cdf_x_lower_q}, upper={args.cdf_x_upper_q}")
     print(f"Computing stats (group-by={group_by}) ...")
     pair_stats = build_per_pair_stats(df, group_by)
     topo_stats = build_per_topology_stats(df, group_by)
@@ -552,11 +770,13 @@ def main():
     print("Generating charts ...")
     chart_per_pair_scatter(pair_stats, args.out, group_by)
     chart_per_topology_scatter(topo_stats, args.out)
-    chart_cdf_per_pair(pair_stats, args.out)
-    chart_cdf_per_topology(topo_stats, args.out)
-    chart_cdf_raw(df, args.out)
+    chart_cdf_per_pair(pair_stats, args.out, cdf_zoom=cdf_zoom)
+    chart_cdf_per_topology(topo_stats, args.out, cdf_zoom=cdf_zoom)
+    chart_cdf_raw(df, args.out, cdf_zoom=cdf_zoom)
+    chart_topology_delta_cdf(topo_stats, args.out, cdf_zoom=cdf_zoom)
     chart_improvement_heatmap(topo_stats, args.out)
     chart_distributions(df, args.out)
+    chart_attacker_accuracy(exports, args.out)
     print("Done.")
 
 
