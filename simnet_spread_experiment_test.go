@@ -1,5 +1,5 @@
 // Simnet experiment
-// Command: go test -tags simnet -run TestSimnetSpreadVsGossipsubLatencyStretch -v .
+// Command: go test -timeout 60m -tags simnet -run TestSimnetSpreadVsGossipsubLatencyStretch -v .
 
 package pubsub
 
@@ -70,6 +70,11 @@ const (
 	SPREAD_ATTACKER_PCTS           = "SPREAD_ATTACKER_PCTS"
 )
 
+const (
+	DANDELION_FANOUT_ENV = "DANDELION_FANOUT"
+	DANDELION_PROB_ENV   = "DANDELION_PROB"
+)
+
 type delivery struct {
 	Dst       int     `json:"dst"`        // original node ID from nodes.json
 	LatencyMS float64 `json:"latency_ms"` // observed one-way latency in ms
@@ -135,9 +140,11 @@ type spreadExperimentExport struct {
 
 	Gossipsub []trialResult `json:"gossipsub"`
 	Spread    []trialResult `json:"spread"`
+	Dandelion []trialResult `json:"dandelion"`
 
-	GossipsubAttackerAccuracy []attackerAccuracySummary `json:"gossipsub_attacker_accuracy,omitempty"`
-	SpreadAttackerAccuracy    []attackerAccuracySummary `json:"spread_attacker_accuracy,omitempty"`
+	GossipsubAttackerAccuracy  []attackerAccuracySummary `json:"gossipsub_attacker_accuracy,omitempty"`
+	SpreadAttackerAccuracy     []attackerAccuracySummary `json:"spread_attacker_accuracy,omitempty"`
+	DandelionAttackerAccuracy  []attackerAccuracySummary `json:"dandelion_attacker_accuracy,omitempty"`
 }
 
 func TestSimnetSpreadVsGossipsubLatencyStretch(t *testing.T) {
@@ -177,13 +184,27 @@ func TestSimnetSpreadVsGossipsubLatencyStretch(t *testing.T) {
 	})
 	t.Logf("spread: %d trials completed in %s", trials, time.Since(spreadStartTime))
 
-	t.Logf("gossipsub: %d raw observations", countDeliveries(gsRes))
-	t.Logf("spread:    %d raw observations", countDeliveries(spreadRes))
+	// Run dandelion
+	dandelionStartTime := time.Now()
+	dandelionTopo := makeEthereumLikeTopology(t, nodeCount, seed)
+	defer dandelionTopo.closeFn()
+	dandelionRes := runScenario(t, dandelionTopo, scenarioConfig{
+		name:         "dandelion",
+		trials:       trials,
+		useDandelion: true,
+		enableCrash:  envBool(SPREAD_SIMNET_ENABLE_CRASH_ENV, false),
+		crashPct:     envFloat(SPREAD_SIMNET_CRASH_PCT_ENV, 0),
+	})
+	t.Logf("dandelion: %d trials completed in %s", trials, time.Since(dandelionStartTime))
 
-	if exportPath, err := maybeWriteSpreadExperimentExport(gsRes, spreadRes, gsTopo.nodeIDs, nodeCount, trials, int(seed)); err != nil {
+	t.Logf("gossipsub:  %d raw observations", countDeliveries(gsRes))
+	t.Logf("spread:     %d raw observations", countDeliveries(spreadRes))
+	t.Logf("dandelion:  %d raw observations", countDeliveries(dandelionRes))
+
+	if exportPath, err := maybeWriteExperimentExport(gsRes, spreadRes, dandelionRes, gsTopo.nodeIDs, nodeCount, trials, int(seed)); err != nil {
 		t.Fatalf("write %s: %v", SPREAD_SIMNET_EXPORT_PATH_ENV, err)
 	} else if exportPath != "" {
-		t.Logf("wrote spread experiment export to %s", exportPath)
+		t.Logf("wrote experiment export to %s", exportPath)
 	}
 }
 
@@ -199,6 +220,7 @@ type scenarioConfig struct {
 	name             string
 	trials           int
 	useSpread        bool
+	useDandelion     bool
 	warmupEvery      int
 	warmupPerPublish int
 	enableCrash      bool
@@ -227,7 +249,6 @@ func runScenario(t *testing.T, topo experimentTopology, cfg scenarioConfig) expe
 	psubs := make([]*PubSub, 0, len(topo.hosts))
 	for _, h := range topo.hosts {
 		opts := append([]Option{}, baseOpts...)
-		// Add spread options if set
 		if cfg.useSpread {
 			vsvc := vivaldi.NewService(h, &vivaldi.Config{Timeout: 500 * time.Millisecond})
 			opts = append(opts,
@@ -236,6 +257,11 @@ func runScenario(t *testing.T, topo experimentTopology, cfg scenarioConfig) expe
 				WithSpreadClusteringConfig(spreadClusteringConfigFromEnv()),
 				WithSpreadPropagationConfig(spreadPropagationConfigFromEnv()),
 				WithVivaldi(vsvc, spreadVivaldiConfigFromEnv()),
+			)
+		} else if cfg.useDandelion {
+			opts = append(opts,
+				WithProtocolChoice(DANDELION),
+				WithDandelionConfig(dandelionConfigFromEnv()),
 			)
 		}
 		psubs = append(psubs, getGossipsub(ctx, h, opts...))
@@ -283,7 +309,7 @@ func runScenario(t *testing.T, topo experimentTopology, cfg scenarioConfig) expe
 			for _, idx := range perm[:crashCount] {
 				crashed[idx] = struct{}{}
 				_ = topics[idx].Close()
-				_ = subs[idx].Cancel()
+				subs[idx].Cancel()
 				_ = topo.hosts[idx].Close()
 			}
 			alive = alive[:0]
@@ -627,10 +653,6 @@ func makeEthereumLikeTopology(t *testing.T, n int, seed int64) experimentTopolog
 		weights: weights,
 		nodeIDs: nodeIDs,
 		closeFn: func() {
-			network.Close()
-			for _, h := range meta.Nodes {
-				_ = h.Close()
-			}
 		},
 	}
 }
@@ -736,21 +758,23 @@ func makeEthereumLikeLatencyMatrix(t *testing.T, n int, seed int64) ([][]time.Du
 	return weights, nodeIDs
 }
 
-func buildSpreadExperimentExport(gsRes, spreadRes experimentResult, nodeIDs []int, nodeCount, trials, seed int) spreadExperimentExport {
+func buildExperimentExport(gsRes, spreadRes, dandelionRes experimentResult, nodeIDs []int, nodeCount, trials, seed int) spreadExperimentExport {
 	return spreadExperimentExport{
-		GeneratedAt:               time.Now().UTC().Format(time.RFC3339Nano),
-		Nodes:                     nodeCount,
-		Trials:                    trials,
-		Seed:                      seed,
-		WarmupEvery:               envInt("SPREAD_SIMNET_WARMUP_EVERY", SPREAD_SIMNET_WARMUP_EVERY),
-		WarmupPerPublish:          envInt("SPREAD_SIMNET_WARMUP_ROUNDS_PER_PUBLISH", SPREAD_SIMNET_WARMUP_ROUNDS_PER_PUBLISH),
-		LinkMiBps:                 envInt("SPREAD_SIMNET_LINK_MIBPS", SPREAD_SIMNET_LINK_MIBPS),
-		ScenarioTimeoutMs:         int(SPREAD_SIMNET_SCENARIO_TIMEOUT / time.Millisecond),
-		NodeIDs:                   nodeIDs,
-		Gossipsub:                 gsRes.trials,
-		Spread:                    spreadRes.trials,
-		GossipsubAttackerAccuracy: summarizeAttackerAccuracy(gsRes),
-		SpreadAttackerAccuracy:    summarizeAttackerAccuracy(spreadRes),
+		GeneratedAt:                time.Now().UTC().Format(time.RFC3339Nano),
+		Nodes:                      nodeCount,
+		Trials:                     trials,
+		Seed:                       seed,
+		WarmupEvery:                envInt("SPREAD_SIMNET_WARMUP_EVERY", SPREAD_SIMNET_WARMUP_EVERY),
+		WarmupPerPublish:           envInt("SPREAD_SIMNET_WARMUP_ROUNDS_PER_PUBLISH", SPREAD_SIMNET_WARMUP_ROUNDS_PER_PUBLISH),
+		LinkMiBps:                  envInt("SPREAD_SIMNET_LINK_MIBPS", SPREAD_SIMNET_LINK_MIBPS),
+		ScenarioTimeoutMs:          int(SPREAD_SIMNET_SCENARIO_TIMEOUT / time.Millisecond),
+		NodeIDs:                    nodeIDs,
+		Gossipsub:                  gsRes.trials,
+		Spread:                     spreadRes.trials,
+		Dandelion:                  dandelionRes.trials,
+		GossipsubAttackerAccuracy:  summarizeAttackerAccuracy(gsRes),
+		SpreadAttackerAccuracy:     summarizeAttackerAccuracy(spreadRes),
+		DandelionAttackerAccuracy:  summarizeAttackerAccuracy(dandelionRes),
 	}
 }
 
@@ -813,12 +837,12 @@ func writeSpreadExperimentExport(path string, doc spreadExperimentExport) error 
 	return writeAtomicFile(path, b, 0o644)
 }
 
-func maybeWriteSpreadExperimentExport(gsRes, spreadRes experimentResult, nodeIDs []int, nodeCount, trials, seed int) (string, error) {
+func maybeWriteExperimentExport(gsRes, spreadRes, dandelionRes experimentResult, nodeIDs []int, nodeCount, trials, seed int) (string, error) {
 	exportPath := os.Getenv(SPREAD_SIMNET_EXPORT_PATH_ENV)
 	if exportPath == "" {
 		return "", nil
 	}
-	doc := buildSpreadExperimentExport(gsRes, spreadRes, nodeIDs, nodeCount, trials, seed)
+	doc := buildExperimentExport(gsRes, spreadRes, dandelionRes, nodeIDs, nodeCount, trials, seed)
 	doc.RunID = os.Getenv(SPREAD_SIMNET_RUN_ID_ENV)
 	doc.GitCommit = os.Getenv(SPREAD_SIMNET_GIT_COMMIT_ENV)
 	return exportPath, writeSpreadExperimentExport(exportPath, doc)
@@ -897,6 +921,13 @@ func spreadVivaldiConfigFromEnv() *VivaldiConfig {
 		IN3MADKRandom:    envFloat(SPREAD_IN3_MADK_RANDOM, 5),
 		IN3MADKClose:     envFloat(SPREAD_IN3_MADK_CLOSE, 8),
 		IN3MinSamples:    envInt(SPREAD_IN3_MIN_SAMPLES, 4),
+	}
+}
+
+func dandelionConfigFromEnv() *DandelionGossipConfig {
+	return &DandelionGossipConfig{
+		FANOUT: envInt(DANDELION_FANOUT_ENV, FANOUT),
+		PROB:   envFloat(DANDELION_PROB_ENV, PROB),
 	}
 }
 

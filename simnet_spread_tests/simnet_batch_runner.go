@@ -64,6 +64,9 @@ const (
 	spreadIN3MADKCloseEnv      = "SPREAD_IN3_MADK_CLOSE"
 	spreadIN3MinSamplesEnv     = "SPREAD_IN3_MIN_SAMPLES"
 	spreadAttackerPctsEnv      = "SPREAD_ATTACKER_PCTS"
+
+	dandelionFanoutEnv = "DANDELION_FANOUT"
+	dandelionProbEnv   = "DANDELION_PROB"
 )
 
 type stringListFlag []string
@@ -106,6 +109,8 @@ type runConfig struct {
 	SpreadIN3Close     float64 `json:"spread_in3_madk_close"`
 	SpreadIN3Min       int     `json:"spread_in3_min_samples"`
 	SpreadAttackerPcts string  `json:"spread_attacker_pcts"`
+	DandelionFanout    int     `json:"dandelion_fanout"`
+	DandelionProb      float64 `json:"dandelion_prob"`
 }
 
 type runExport struct {
@@ -153,10 +158,16 @@ type batchOptions struct {
 	EnvOverrides  map[string]string
 }
 
+type dandelionConfigYAML struct {
+	Fanout *int     `yaml:"dandelion_fanout"`
+	Prob   *float64 `yaml:"dandelion_prob"`
+}
+
 type fileConfig struct {
-	Batch  batchConfigYAML  `yaml:"batch"`
-	Simnet simnetConfigYAML `yaml:"simnet"`
-	Spread spreadConfigYAML `yaml:"spread"`
+	Batch     batchConfigYAML     `yaml:"batch"`
+	Simnet    simnetConfigYAML    `yaml:"simnet"`
+	Spread    spreadConfigYAML    `yaml:"spread"`
+	Dandelion dandelionConfigYAML `yaml:"dandelion"`
 }
 
 type batchConfigYAML struct {
@@ -402,7 +413,7 @@ func executeGoTestRun(ctx context.Context, runID, attempt int, runIDLabel, expor
 		envCopy[spreadScenarioTimeoutMSEnv] = strconv.Itoa(cfg.ScenarioTimeoutMs)
 	}
 
-	cmd := exec.CommandContext(ctx, "go", "test", "-tags", "simnet", "-run", testName, "-v", ".")
+	cmd := exec.CommandContext(ctx, "go", "test", "-timeout", "60m", "-tags", "simnet", "-run", testName, "-v", ".")
 	cmd.Env = envMapToList(envCopy)
 	output, err := cmd.CombinedOutput()
 	_ = os.WriteFile(logPath, output, 0o644)
@@ -538,6 +549,9 @@ func defaultFileConfig() fileConfig {
 	in3Min := 4
 	attackerPcts := ""
 
+	dandelionFanout := 6
+	dandelionProb := 0.8
+
 	return fileConfig{
 		Batch: batchConfigYAML{
 			Runs:          &runs,
@@ -580,6 +594,10 @@ func defaultFileConfig() fileConfig {
 			IN3MADKClose:           &in3Close,
 			IN3MinSamples:          &in3Min,
 			AttackerPcts:           &attackerPcts,
+		},
+		Dandelion: dandelionConfigYAML{
+			Fanout: &dandelionFanout,
+			Prob:   &dandelionProb,
 		},
 	}
 }
@@ -632,6 +650,9 @@ func validateConfig(cfg fileConfig) error {
 	require(cfg.Spread.IN3MinSamples != nil, "spread.spread_in3_min_samples")
 	require(cfg.Spread.AttackerPcts != nil, "spread.spread_attacker_pcts")
 
+	require(cfg.Dandelion.Fanout != nil, "dandelion.dandelion_fanout")
+	require(cfg.Dandelion.Prob != nil, "dandelion.dandelion_prob")
+
 	if len(missing) > 0 {
 		return fmt.Errorf("config missing required keys: %s", strings.Join(missing, ", "))
 	}
@@ -677,6 +698,8 @@ func configToEnvMap(cfg fileConfig) map[string]string {
 		spreadIN3MADKCloseEnv:      fmt.Sprintf("%g", *cfg.Spread.IN3MADKClose),
 		spreadIN3MinSamplesEnv:     strconv.Itoa(*cfg.Spread.IN3MinSamples),
 		spreadAttackerPctsEnv:      *cfg.Spread.AttackerPcts,
+		dandelionFanoutEnv:         strconv.Itoa(*cfg.Dandelion.Fanout),
+		dandelionProbEnv:           fmt.Sprintf("%g", *cfg.Dandelion.Prob),
 	}
 }
 
@@ -713,6 +736,8 @@ func configFromEnv(env map[string]string) runConfig {
 	cfg.SpreadIN3Close = envFloatFromMap(env, spreadIN3MADKCloseEnv)
 	cfg.SpreadIN3Min = envIntFromMap(env, spreadIN3MinSamplesEnv)
 	cfg.SpreadAttackerPcts = env[spreadAttackerPctsEnv]
+	cfg.DandelionFanout = envIntFromMap(env, dandelionFanoutEnv)
+	cfg.DandelionProb = envFloatFromMap(env, dandelionProbEnv)
 	return cfg
 }
 
