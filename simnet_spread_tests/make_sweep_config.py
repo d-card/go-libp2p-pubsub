@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """
-Build a sweep_config.yaml with 8 groups, subsampling from the generated
-experiment-sets CSV so each group has a tractable number of points (~5–7).
+Build a sweep_config.yaml with 8 groups, sampling from generated experiment sets
+so each group has a tractable number of points (~5–7).
 
-Groups produced (matching the spec):
-  A_Ce1.5  A_Ce3.0  A_Ce4.5    — 3 lines: fix Ce, vary (p_i, f_i)
-  B_Ci1.5  B_Ci3.0  B_Ci4.5    — 3 lines: fix Ci, vary (p_e, f_e)
+Groups produced:
+  A_Ce1.5  A_Ce3.0  A_Ce4.5    — 3 lines: fix (p_e, f_e) canonically, vary (p_i, f_i)
+  B_Ci1.5  B_Ci2.0  B_Ci2.5    — 3 lines: fix (p_i, f_i) canonically, vary (p_e, f_e)
   C_fixed_fanouts              — 1 line: fix (f_i, f_e), vary (p_i, p_e)
   D_fanouts_vs_bernoullis      — 1 line: diagonal trade-off
 
 Usage (from repo root):
     python3 simnet_spread_tests/make_sweep_config.py \\
         --out simnet_spread_tests/sweep_config.yaml \\
-        [--points-per-line 6] [--step 0.025]
+        [--points-per-line 6]
 """
 
 import argparse
@@ -25,6 +25,13 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from generate_experiment_sets import build_groups  # type: ignore
+
+
+def first_n_by(df, key, n):
+    """Return first n rows sorted ascending by `key`."""
+    if df.empty:
+        return df
+    return df.sort_values(key).head(n).reset_index(drop=True)
 
 
 def evenly_spaced(df, key, n):
@@ -40,13 +47,10 @@ def evenly_spaced(df, key, n):
 
 def row_to_cfg(row):
     """CSV row -> [p_i, f_i, p_e, f_e] list."""
-    p_i = float(row["p_i"])
+    p_i = round(float(row["p_i"]), 4)
     f_i = int(row["f_i"])
-    p_e = float(row["p_e"])
+    p_e = round(float(row["p_e"]), 4)
     f_e = int(row["f_e"])
-    # Normalize probabilities to at most 2 decimals to keep tags stable.
-    p_i = round(p_i, 2)
-    p_e = round(p_e, 2)
     return [p_i, f_i, p_e, f_e]
 
 
@@ -55,67 +59,70 @@ def main():
     p.add_argument("--out", required=True, help="Path to write the YAML")
     p.add_argument("--points-per-line", type=int, default=6,
                    help="Target points per group/line (default: 6)")
-    p.add_argument("--step", type=float, default=0.025,
-                   help="Probability step for the base generator (default: 0.025)")
-    p.add_argument("--max-fanout-intra", type=int, default=5)
-    p.add_argument("--max-fanout-ext",   type=int, default=15)
+    p.add_argument("--max-fanout-intra", type=int, default=15)
+    p.add_argument("--max-fanout-ext",   type=int, default=20)
+    p.add_argument("--canonical-pe", type=float, default=0.3,
+                   help="Fixed p_e for all Group A configs (default: 0.3)")
+    p.add_argument("--ci-pairs", default="1.5,0.25,3;2.0,0.5,3;2.5,0.5,4",
+                   help="Semicolon-separated ci_total,p_i,f_i triples for Group B "
+                        "(default: 1.5,0.25,3;2.0,0.5,3;2.5,0.5,4)")
+    p.add_argument("--fixed-fanouts", default="3,6",
+                   help="Fanouts (f_i,f_e) to use for Group C")
     p.add_argument("--topologies", default="1337,1338,1339",
                    help="Comma-separated list of topology seeds")
     p.add_argument("--nodes", type=int, default=30,
                    help="SPREAD_SIMNET_NODES (default: 30)")
     p.add_argument("--trials", type=int, default=30,
                    help="SPREAD_SIMNET_TRIALS — messages published per run (default: 30)")
-    p.add_argument("--fixed-fanouts", default="3,6",
-                   help="Fanouts (f_i,f_e) to use for Group C")
     args = p.parse_args()
+
+    ci_pairs = tuple(
+        (float(a), float(b), int(c))
+        for a, b, c in (triple.split(",") for triple in args.ci_pairs.split(";"))
+    )
 
     base, grouped = build_groups(
         max_fanout_ext=args.max_fanout_ext,
         max_fanout_intra=args.max_fanout_intra,
-        prob_step=args.step,
         ce_targets=(1.5, 3.0, 4.5),
-        ci_targets=(1.5, 3.0, 4.5),
+        ce_canonical_pe=args.canonical_pe,
+        ci_pairs=ci_pairs,
         fixed_fanouts=(tuple(int(x) for x in args.fixed_fanouts.split(",")),),
     )
 
     out_groups = {}
     n = args.points_per_line
 
-    # Groups A (fix Ce, vary p_i) — sort/sample by p_i
+    # Groups A: fixed canonical (p_e, f_e), vary (p_i, f_i) — first n by f_i ascending
     for ce in (1.5, 3.0, 4.5):
         sub = grouped[(grouped["group"] == "A") & (grouped["subgroup"] == f"Ce={ce}")]
-        sampled = evenly_spaced(sub, "p_i", n)
+        sampled = first_n_by(sub, "f_i", n)
         if not sampled.empty:
             out_groups[f"A_Ce{ce}"] = [row_to_cfg(r) for _, r in sampled.iterrows()]
 
-    # Groups B (fix Ci, vary p_e) — sort/sample by p_e
-    for ci in (1.5, 3.0, 4.5):
-        sub = grouped[(grouped["group"] == "B") & (grouped["subgroup"] == f"Ci={ci}")]
-        sampled = evenly_spaced(sub, "p_e", n)
+    # Groups B: fixed canonical (p_i, f_i), vary (p_e, f_e) — first n by f_e ascending
+    for ci_total, _pi, _fi in ci_pairs:
+        sub = grouped[(grouped["group"] == "B") & (grouped["subgroup"] == f"Ci={ci_total}")]
+        sampled = first_n_by(sub, "f_e", n)
         if not sampled.empty:
-            out_groups[f"B_Ci{ci}"] = [row_to_cfg(r) for _, r in sampled.iterrows()]
+            out_groups[f"B_Ci{ci_total}"] = [row_to_cfg(r) for _, r in sampled.iterrows()]
 
-    # Group C (fix fanouts, vary p_i) — sort/sample by p_i
+    # Group C: fix fanouts, vary p_i — evenly spaced
     fi, fe = (int(x) for x in args.fixed_fanouts.split(","))
     sub = grouped[(grouped["group"] == "C") & (grouped["subgroup"] == f"f_i={fi},f_e={fe}")]
     sampled = evenly_spaced(sub, "p_i", n)
     if not sampled.empty:
         out_groups[f"C_f{fi}_f{fe}"] = [row_to_cfg(r) for _, r in sampled.iterrows()]
 
-    # Group D — diagonal: walk from high-fanout/low-prob to low-fanout/high-prob
-    # Strategy: sort all base configs by (f_i+f_e) descending, then pick evenly
-    # spaced ones to cover the spectrum. Restrict to a reasonable "corridor".
+    # Group D: diagonal walk from high-fanout/low-prob to low-fanout/high-prob
     base_sorted = base.copy()
     base_sorted["fan_sum"]  = base_sorted["f_i"] + base_sorted["f_e"]
     base_sorted["prob_sum"] = base_sorted["p_i"] + base_sorted["p_e"]
-    # Prefer configs near the diagonal: high fan_sum + low prob_sum OR low + high
-    # Use the sum-rank as the diagonal axis
     base_sorted["diag"] = base_sorted["fan_sum"] - 10 * base_sorted["prob_sum"]
     sampled = evenly_spaced(base_sorted, "diag", n)
     if not sampled.empty:
         out_groups["D_fanouts_vs_bernoullis"] = [row_to_cfg(r) for _, r in sampled.iterrows()]
 
-    # Build the final YAML
     config = {
         "topologies":   [int(x) for x in args.topologies.split(",")],
 
@@ -139,7 +146,7 @@ def main():
             # Vivaldi
             "SPREAD_CC":                              0.25,
             "SPREAD_CE":                              0.25,
-            "SPREAD_NEWTON":                          True,
+            "SPREAD_NEWTON":                          False,
             "SPREAD_OUTLIER_THRESHOLD":               0,
             "SPREAD_SAMPLES":                         1,
             "SPREAD_INTERVAL_MS":                     150,
@@ -159,11 +166,9 @@ def main():
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    # Write YAML: block style for dicts, flow style for the 4-tuple configs.
     class _Dumper(yaml.SafeDumper):
         pass
     def _repr_list(dumper, data):
-        # Flow style only for "leaf" lists of scalars (e.g., [0.5, 8, 0.15, 10]).
         is_leaf = all(isinstance(x, (int, float, str, bool)) for x in data)
         return dumper.represent_sequence("tag:yaml.org,2002:seq", data,
                                          flow_style=is_leaf)
@@ -172,7 +177,6 @@ def main():
     with open(out_path, "w") as f:
         yaml.dump(config, f, Dumper=_Dumper, sort_keys=False, default_flow_style=False)
 
-    # Report
     total_unique = len({tuple(c) for cfgs in out_groups.values() for c in cfgs})
     total_runs = total_unique * len(config["topologies"])
     print(f"Wrote {out_path}")
