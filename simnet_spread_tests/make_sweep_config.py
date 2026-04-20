@@ -57,8 +57,8 @@ def main():
                    help="Target points per group/line (default: 6)")
     p.add_argument("--step", type=float, default=0.025,
                    help="Probability step for the base generator (default: 0.025)")
-    p.add_argument("--max-fanout-intra", type=int, default=15)
-    p.add_argument("--max-fanout-ext",   type=int, default=20)
+    p.add_argument("--max-fanout-intra", type=int, default=5)
+    p.add_argument("--max-fanout-ext",   type=int, default=15)
     p.add_argument("--topologies", default="1337,1338,1339",
                    help="Comma-separated list of topology seeds")
     p.add_argument("--nodes", type=int, default=30,

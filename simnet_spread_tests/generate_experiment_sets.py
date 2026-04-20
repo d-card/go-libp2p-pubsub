@@ -71,14 +71,23 @@ def build_groups(
     tol = prob_step / 2
     groups = []
 
-    # Group A: Fix Ce, vary Ci side (f_i, p_i).
+    # Group A: Fix one canonical (p_e, f_e) pair per Ce target, vary (p_i, f_i).
+    # Picking the pair that gives the most rows (most variation on the intra side).
     for ce in ce_targets:
-        sel = base[np.abs(base["Ce"] - ce) <= tol]
+        pool = base[np.abs(base["Ce"] - ce) <= tol]
+        if pool.empty:
+            continue
+        best_pe, best_fe = pool.groupby(["p_e", "f_e"]).size().idxmax()
+        sel = base[(base["p_e"] == best_pe) & (base["f_e"] == best_fe)]
         groups.append(_attach_group(sel, "A", f"Ce={ce}"))
 
-    # Group B: Fix Ci, vary Ce side (f_e, p_e).
+    # Group B: Fix one canonical (p_i, f_i) pair per Ci target, vary (p_e, f_e).
     for ci in ci_targets:
-        sel = base[np.abs(base["Ci"] - ci) <= tol]
+        pool = base[np.abs(base["Ci"] - ci) <= tol]
+        if pool.empty:
+            continue
+        best_pi, best_fi = pool.groupby(["p_i", "f_i"]).size().idxmax()
+        sel = base[(base["p_i"] == best_pi) & (base["f_i"] == best_fi)]
         groups.append(_attach_group(sel, "B", f"Ci={ci}"))
 
     # Group C: Fix fanouts, vary probabilities.
