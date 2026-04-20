@@ -1,6 +1,13 @@
 # Simnet Spread Experiments
 
-## Run Experiments
+Two ways to run experiments:
+
+1. **Batch runner** — one parameter set, N repeated runs. Good for convergence / noise tests.
+2. **Sweep runner** — many parameter sets organized into groups, each run on multiple network topologies. Designed for the Anonymity vs Stretch scatter plot across the E=6 constraint surface. See [Parameter Sweep](#parameter-sweep-groups--topologies) below.
+
+---
+
+## Batch Runner
 
 From repo root:
 
@@ -129,3 +136,101 @@ Generated charts:
 | `06_cdf_raw.png` | CDF of all raw observations |
 | `07_improvement_heatmap.png` | % improvement heatmap (Spread vs GossipSub) |
 | `08_distributions.png` | Latency & stretch histograms + delta distributions |
+
+---
+
+## Parameter Sweep (groups × topologies)
+
+Designed for exploring the 4-parameter Spread space under the constant-fanout constraint
+`(1 - p_i) + p_i·f_i + p_e·f_e = 6`, producing a scatter of Anonymity vs Stretch with configs grouped into semantic regions (fix Ce, fix Ci, fix fanouts, diagonal).
+
+Pipeline:
+
+```
+generate_experiment_sets.py  →  make_sweep_config.py  →  sweep_config.yaml
+                                                             │
+                                        sweep_runner.py  ────┘   writes outputs/<sweep>/runs/
+                                                             │
+                                        sweep_plotter.py ────┘   reads outputs + plot_groups.yaml
+```
+
+### 1. Enumerate valid (p_i, f_i, p_e, f_e) sets
+
+```bash
+python3 simnet_spread_tests/generate_experiment_sets.py
+```
+
+Produces `p2p_experimental_sets_*.csv` — enumerates every (p_i, f_i, p_e, f_e) satisfying the E=6 constraint and groups them as **A/B/C/D** (fix Ce; fix Ci; fix fanouts; fanouts-vs-bernoullis diagonal).
+
+The CSVs are convenient for manual inspection but **not required** by the rest of the pipeline — `make_sweep_config.py` calls `build_groups` directly.
+
+### 2. Generate a sweep config
+
+```bash
+python3 simnet_spread_tests/make_sweep_config.py \
+    --out simnet_spread_tests/sweep_config.yaml \
+    --points-per-line 6 \
+    --topologies 1337,1338,1339 \
+    --nodes 30 \
+    --trials 30
+```
+
+Subsamples the enumerated sets into 8 groups (3 × A subgroups, 3 × B subgroups, 1 × C, 1 × D) with ~5–6 configs each, and writes a ready-to-run YAML.
+
+Config sections:
+
+| Section | Meaning |
+|---------|---------|
+| `topologies:` | list of seeds — each unique spread config is run once per seed |
+| `env:` | pass-through `SPREAD_*` env vars (including `SPREAD_SIMNET_NODES`, `SPREAD_SIMNET_TRIALS`) |
+| `groups:` | `group_name → list of [p_i, f_i, p_e, f_e]` — each group is one connected line on the plot |
+
+### 3. Run the sweep
+
+```bash
+python3 simnet_spread_tests/sweep_runner.py \
+    --config simnet_spread_tests/sweep_config.yaml \
+    --out-dir simnet_spread_tests/outputs/sweep_$(date +%Y%m%d_%H%M%S)
+```
+
+Resumable: kill at any time and rerun with the same `--out-dir` — every `(config, topology)` whose `topo-<seed>.json` already exists is skipped.
+
+Output layout:
+
+```text
+outputs/<sweep_name>/
+  sweep_config.yaml                       # copy of the input
+  runs/
+    ir<p_i>_ip<p_e>_if<f_i>_ef<f_e>/     # one directory per unique config
+      topo-<seed>.json                    # raw export (same schema as batch runner)
+      topo-<seed>.meta.json               # timestamp, duration, groups
+      topo-<seed>.attempt-N.log           # stdout from each attempt
+  results.jsonl                           # append-only log of every completed run
+```
+
+### 4. Plot
+
+```bash
+python3 simnet_spread_tests/sweep_plotter.py \
+    --data-dir simnet_spread_tests/outputs/<sweep_name> \
+    --groups simnet_spread_tests/plot_groups.yaml
+```
+
+The plot groups YAML is independent from the run config — you can re-group the same data for different charts without re-running experiments. It only needs a `groups:` section; each tuple must match exactly a `(p_i, f_i, p_e, f_e)` that was run.
+
+Options:
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--stretch-stat` | `mean` | `mean \| median \| p90 \| p99` — which stretch statistic on the X axis |
+| `--attacker-pct` | `0.2` | attacker fraction for the anonymity metric |
+| `--sort-key` | `p_i` | how to order points within a group for the connecting line |
+
+Outputs to `<data-dir>/plots/`:
+
+| File | Description |
+|------|-------------|
+| `scatter_anon_vs_stretch_<stat>.png` | the main plot — lower-left = better |
+| `metrics_attacker<pct>.csv` | per-config aggregated metrics for any downstream analysis |
+
+Plot anytime — even while the runner is still going. It only reads completed runs.

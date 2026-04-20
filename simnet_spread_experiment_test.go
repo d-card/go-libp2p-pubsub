@@ -283,7 +283,7 @@ func runScenario(t *testing.T, topo experimentTopology, cfg scenarioConfig) expe
 			for _, idx := range perm[:crashCount] {
 				crashed[idx] = struct{}{}
 				_ = topics[idx].Close()
-				_ = subs[idx].Cancel()
+				subs[idx].Cancel()
 				_ = topo.hosts[idx].Close()
 			}
 			alive = alive[:0]
