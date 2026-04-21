@@ -259,15 +259,19 @@ Options:
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--stretch-stat` | `mean` | `mean \| median \| p90 \| p99` — which stretch statistic on the X axis |
 | `--attacker-pct` | `0.2` | attacker fraction for the anonymity metric |
-| `--sort-key` | `p_i` | how to order points within a group for the connecting line |
+| `--sort-key` | `p_i` | how to order points within a group for the connecting line (`p_i \| f_i \| p_e \| f_e \| x \| anon`; `x` sorts by the current chart's X axis) |
 
-Outputs to `<data-dir>/plots/`:
+Outputs to `<data-dir>/plots/` — one scatter per (metric, stat), six total:
 
-| File | Description |
-|------|-------------|
-| `scatter_anon_vs_stretch_<stat>.png` | the main plot — lower-left = better |
-| `metrics_attacker<pct>.csv` | per-config aggregated metrics for any downstream analysis |
+| File | X axis |
+|------|--------|
+| `scatter_anon_vs_stretch_mean.png`    | spread stretch — mean |
+| `scatter_anon_vs_stretch_median.png`  | spread stretch — median |
+| `scatter_anon_vs_stretch_p95.png`     | spread stretch — p95 |
+| `scatter_anon_vs_latency_mean.png`    | spread latency (ms) — mean |
+| `scatter_anon_vs_latency_median.png`  | spread latency (ms) — median |
+| `scatter_anon_vs_latency_p95.png`     | spread latency (ms) — p95 |
+| `metrics_attacker<pct>.csv`           | per-config aggregates (stretch mean/median/p90/p95/p99 + latency mean/median/p95 + accuracy) |
 
 Plot anytime — even while the runner is still going. It only reads completed runs.

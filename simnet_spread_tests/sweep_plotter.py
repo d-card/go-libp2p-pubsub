@@ -80,17 +80,27 @@ def load_config_data(config_dir, topology_filter=None):
 
 
 def aggregate(exports, attacker_pct=0.2):
-    """Compute per-config aggregated metrics across all topologies."""
-    gs_s, sp_s, gs_a, sp_a = [], [], [], []
+    """Compute per-config aggregated metrics across all topologies.
+
+    Collects every delivery's `stretch` and `latency_ms` across the exports
+    (flattened over trials and topologies), then summarizes each with
+    mean / median / p90 / p95 / p99. Accuracy buckets are averaged over
+    topologies at the requested attacker_pct.
+    """
+    gs_s, sp_s = [], []   # stretch values
+    gs_l, sp_l = [], []   # latency values (ms)
+    gs_a, sp_a = [], []   # accuracy at the requested attacker_pct
     gs_curve, sp_curve = defaultdict(list), defaultdict(list)
 
     for exp in exports:
         for t in exp.get("gossipsub", []):
             for d in t.get("deliveries", []):
                 gs_s.append(d["stretch"])
+                gs_l.append(d["latency_ms"])
         for t in exp.get("spread", []):
             for d in t.get("deliveries", []):
                 sp_s.append(d["stretch"])
+                sp_l.append(d["latency_ms"])
 
         for e in exp.get("gossipsub_attacker_accuracy", []):
             p = e["attacker_pct"]
@@ -117,8 +127,17 @@ def aggregate(exports, attacker_pct=0.2):
         "sp_stretch_median":  float(np.median(sp_s)),
         "gs_stretch_p90":     float(np.percentile(gs_s, 90)),
         "sp_stretch_p90":     float(np.percentile(sp_s, 90)),
+        "gs_stretch_p95":     float(np.percentile(gs_s, 95)),
+        "sp_stretch_p95":     float(np.percentile(sp_s, 95)),
         "gs_stretch_p99":     float(np.percentile(gs_s, 99)),
         "sp_stretch_p99":     float(np.percentile(sp_s, 99)),
+
+        "gs_latency_mean":    float(np.mean(gs_l)),
+        "sp_latency_mean":    float(np.mean(sp_l)),
+        "gs_latency_median":  float(np.median(gs_l)),
+        "sp_latency_median":  float(np.median(sp_l)),
+        "gs_latency_p95":     float(np.percentile(gs_l, 95)),
+        "sp_latency_p95":     float(np.percentile(sp_l, 95)),
 
         "gs_accuracy":        float(np.mean(gs_a)) if gs_a else None,
         "sp_accuracy":        float(np.mean(sp_a)) if sp_a else None,
@@ -160,7 +179,11 @@ def write_metrics_csv(index, out_path):
             "gs_stretch_mean", "sp_stretch_mean",
             "gs_stretch_median", "sp_stretch_median",
             "gs_stretch_p90", "sp_stretch_p90",
+            "gs_stretch_p95", "sp_stretch_p95",
             "gs_stretch_p99", "sp_stretch_p99",
+            "gs_latency_mean", "sp_latency_mean",
+            "gs_latency_median", "sp_latency_median",
+            "gs_latency_p95", "sp_latency_p95",
             "gs_accuracy", "sp_accuracy"]
     with open(out_path, "w", newline="") as f:
         w = csv.writer(f)
@@ -170,18 +193,20 @@ def write_metrics_csv(index, out_path):
     print(f"  Saved: {out_path}")
 
 
-def chart_anon_vs_stretch(index, groups, out_path,
-                          stretch_stat="mean", anon_stat="accuracy",
-                          sort_key="p_i"):
+def chart_anon_vs_metric(index, groups, out_path,
+                         metric="stretch", stat="mean",
+                         sort_key="p_i"):
     """
-    Scatter: X = Spread mean stretch, Y = Spread deanon accuracy.
+    Scatter: X = Spread `<metric>_<stat>`, Y = Spread deanon accuracy.
     One connected line per group. Points sorted by `sort_key` within a group.
 
-    stretch_stat: "mean" | "median" | "p90" | "p99"
-    anon_stat:    "accuracy" (raw deanon accuracy at attacker_pct) — lower = more anonymous
+    metric: "stretch" | "latency"
+    stat:   "mean" | "median" | "p90" | "p95" | "p99"  (what's actually
+            available depends on what aggregate() computed for `metric`)
     """
-    stretch_key = f"sp_stretch_{stretch_stat}"
-    anon_key    = "sp_accuracy"
+    x_key    = f"sp_{metric}_{stat}"
+    gs_x_key = f"gs_{metric}_{stat}"
+    anon_key = "sp_accuracy"
 
     fig, ax = plt.subplots(figsize=(11, 8))
 
@@ -189,10 +214,10 @@ def chart_anon_vs_stretch(index, groups, out_path,
     markers = ["o", "s", "D", "^", "v", "P", "X", "*", "h", "<"]
 
     # Plot GossipSub baseline (averaged across all configs we have)
-    all_gs_stretch = [m[f"gs_stretch_{stretch_stat}"] for m in index.values()]
-    all_gs_anon    = [m["gs_accuracy"] for m in index.values() if m["gs_accuracy"] is not None]
-    if all_gs_stretch and all_gs_anon:
-        ax.scatter(np.mean(all_gs_stretch), np.mean(all_gs_anon),
+    all_gs_x    = [m[gs_x_key] for m in index.values() if m.get(gs_x_key) is not None]
+    all_gs_anon = [m["gs_accuracy"] for m in index.values() if m["gs_accuracy"] is not None]
+    if all_gs_x and all_gs_anon:
+        ax.scatter(np.mean(all_gs_x), np.mean(all_gs_anon),
                    color="black", marker="*", s=260, zorder=10,
                    label="GossipSub baseline", edgecolors="white", linewidths=1.2)
 
@@ -208,10 +233,10 @@ def chart_anon_vs_stretch(index, groups, out_path,
                 missing.append(tag)
                 continue
             m = index[tag]
-            if m.get(stretch_key) is None or m.get(anon_key) is None:
+            if m.get(x_key) is None or m.get(anon_key) is None:
                 continue
             points.append((m["p_i"], m["f_i"], m["p_e"], m["f_e"],
-                           m[stretch_key], m[anon_key]))
+                           m[x_key], m[anon_key]))
 
         if missing:
             print(f"  warn: group '{group_name}' missing data for: {missing}")
@@ -219,8 +244,9 @@ def chart_anon_vs_stretch(index, groups, out_path,
         if not points:
             continue
 
-        # Sort points by the chosen key for a meaningful line connection
-        sort_idx = {"p_i": 0, "f_i": 1, "p_e": 2, "f_e": 3, "stretch": 4, "anon": 5}[sort_key]
+        # Sort points by the chosen key for a meaningful line connection.
+        # "x" sorts by the current X axis (whatever metric/stat we're drawing).
+        sort_idx = {"p_i": 0, "f_i": 1, "p_e": 2, "f_e": 3, "x": 4, "anon": 5}[sort_key]
         points.sort(key=lambda p: p[sort_idx])
 
         xs = [p[4] for p in points]
@@ -247,10 +273,11 @@ def chart_anon_vs_stretch(index, groups, out_path,
         plt.close(fig)
         return
 
-    ax.set_xlabel(f"Spread stretch ({stretch_stat})  →  worse", fontsize=11)
+    x_unit = " (ms)" if metric == "latency" else ""
+    ax.set_xlabel(f"Spread {metric} ({stat}){x_unit}  →  worse", fontsize=11)
     ax.set_ylabel(f"Spread deanon accuracy  →  worse", fontsize=11)
     ax.set_title(
-        "Anonymity vs Stretch — each point is a parameter config, each line a group.\n"
+        f"Anonymity vs {metric.capitalize()} ({stat}) — each point is a parameter config, each line a group.\n"
         "Lower-left = better trade-off (faster AND more anonymous).",
         fontsize=11)
     ax.legend(fontsize=8, loc="best")
@@ -268,12 +295,10 @@ def main():
     p.add_argument("--out-dir",  default=None, help="Chart output dir (default: <data-dir>/plots)")
     p.add_argument("--attacker-pct", type=float, default=0.2,
                    help="Attacker fraction for the deanon metric (default: 0.2)")
-    p.add_argument("--stretch-stat", default="mean",
-                   choices=["mean", "median", "p90", "p99"],
-                   help="Which stretch statistic to use on the X axis (default: mean)")
     p.add_argument("--sort-key", default="p_i",
-                   choices=["p_i", "f_i", "p_e", "f_e", "stretch", "anon"],
-                   help="Within a group, connect points sorted by this (default: p_i)")
+                   choices=["p_i", "f_i", "p_e", "f_e", "x", "anon"],
+                   help="Within a group, connect points sorted by this (default: p_i). "
+                        "\"x\" sorts by the current chart's X axis.")
     args = p.parse_args()
 
     data_dir = Path(args.data_dir).resolve()
@@ -293,7 +318,6 @@ def main():
 
     print(f"Loading data from: {data_dir}")
     print(f"Attacker pct:      {args.attacker_pct}")
-    print(f"Stretch stat:      {args.stretch_stat}")
     if topology_filter:
         print(f"Topology filter:   {topology_filter}")
 
@@ -304,12 +328,23 @@ def main():
     print(f"Writing outputs to {out_dir}/")
     write_metrics_csv(index, out_dir / f"metrics_attacker{args.attacker_pct}.csv")
 
-    chart_anon_vs_stretch(
-        index, groups,
-        out_dir / f"scatter_anon_vs_stretch_{args.stretch_stat}.png",
-        stretch_stat=args.stretch_stat,
-        sort_key=args.sort_key,
-    )
+    # Emit one scatter per (metric, stat). Keys must match what aggregate()
+    # produces — see that function for the full set.
+    chart_variants = [
+        ("stretch", "mean"),
+        ("stretch", "median"),
+        ("stretch", "p95"),
+        ("latency", "mean"),
+        ("latency", "median"),
+        ("latency", "p95"),
+    ]
+    for metric, stat in chart_variants:
+        chart_anon_vs_metric(
+            index, groups,
+            out_dir / f"scatter_anon_vs_{metric}_{stat}.png",
+            metric=metric, stat=stat,
+            sort_key=args.sort_key,
+        )
 
     print("\nDone.")
 
