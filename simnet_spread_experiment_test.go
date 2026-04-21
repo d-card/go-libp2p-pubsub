@@ -36,6 +36,7 @@ const (
 	SPREAD_SIMNET_GIT_COMMIT_ENV            = "SPREAD_SIMNET_GIT_COMMIT"
 	SPREAD_SIMNET_ENABLE_CRASH_ENV          = "SPREAD_SIMNET_ENABLE_CRASH"
 	SPREAD_SIMNET_CRASH_PCT_ENV             = "SPREAD_SIMNET_CRASH_PCT"
+	SPREAD_SIMNET_START_TRIAL_ENV           = "SPREAD_SIMNET_START_TRIAL"
 	SPREAD_SIMNET_NODES                     = 20               // Number of nodes
 	SPREAD_SIMNET_TRIALS                    = 500              // Number of messages published
 	SPREAD_SIMNET_WARMUP_EVERY              = 0                // Number of trials between warm-up rounds of vivaldi
@@ -146,6 +147,7 @@ func TestSimnetSpreadVsGossipsubLatencyStretch(t *testing.T) {
 	nodeCount := envInt("SPREAD_SIMNET_NODES", SPREAD_SIMNET_NODES)
 	trials := envInt("SPREAD_SIMNET_TRIALS", SPREAD_SIMNET_TRIALS)
 	seed := int64(envInt("SPREAD_SIMNET_SEED", SPREAD_SIMNET_SEED))
+	startTrial := envInt(SPREAD_SIMNET_START_TRIAL_ENV, 0)
 
 	// Run gossipsub
 	gossipsubStartTime := time.Now()
@@ -154,6 +156,7 @@ func TestSimnetSpreadVsGossipsubLatencyStretch(t *testing.T) {
 	gsRes := runScenario(t, gsTopo, scenarioConfig{
 		name:             "gossipsub",
 		trials:           trials,
+		startTrial:       startTrial,
 		useSpread:        false,
 		warmupEvery:      0,
 		warmupPerPublish: 0,
@@ -169,6 +172,7 @@ func TestSimnetSpreadVsGossipsubLatencyStretch(t *testing.T) {
 	spreadRes := runScenario(t, spreadTopo, scenarioConfig{
 		name:             "spread",
 		trials:           trials,
+		startTrial:       startTrial,
 		useSpread:        true,
 		warmupEvery:      envInt("SPREAD_SIMNET_WARMUP_EVERY", SPREAD_SIMNET_WARMUP_EVERY),
 		warmupPerPublish: envInt("SPREAD_SIMNET_WARMUP_ROUNDS_PER_PUBLISH", SPREAD_SIMNET_WARMUP_ROUNDS_PER_PUBLISH),
@@ -198,6 +202,7 @@ func countDeliveries(res experimentResult) int {
 type scenarioConfig struct {
 	name             string
 	trials           int
+	startTrial       int
 	useSpread        bool
 	warmupEvery      int
 	warmupPerPublish int
@@ -307,10 +312,16 @@ func runScenario(t *testing.T, topo experimentTopology, cfg scenarioConfig) expe
 		peerIndexByID[h.ID()] = i
 	}
 	attackerPcts := attackerPercentsFromEnv()
-	rng := rand.New(rand.NewSource(int64(envInt("SPREAD_SIMNET_SEED", SPREAD_SIMNET_SEED) + 7919)))
+	seedBase := int64(envInt("SPREAD_SIMNET_SEED", SPREAD_SIMNET_SEED))
 
-	// Run trials
-	for trial := 0; trial < cfg.trials; trial++ {
+	// Run trials. Trial indices are absolute — when extending an existing run,
+	// cfg.startTrial > 0 shifts the range so trial numbers stay continuous with
+	// the previous export. Source selection (trial % len(alive)) picks up where
+	// the previous run left off, and each trial's RNG is derived purely from
+	// (seed, trial) so continuation is deterministic and independent of any
+	// previously executed trials.
+	for trial := cfg.startTrial; trial < cfg.startTrial+cfg.trials; trial++ {
+		trialRng := rand.New(rand.NewSource(seedBase + 7919 + int64(trial)))
 		// Warm-up vivaldi if configured
 		if cfg.useSpread && cfg.warmupEvery > 0 && trial%cfg.warmupEvery == 0 {
 			for i := 0; i < cfg.warmupPerPublish; i++ {
@@ -388,7 +399,7 @@ func runScenario(t *testing.T, topo experimentTopology, cfg scenarioConfig) expe
 		sort.Slice(tr.FirstReceipts, func(i, j int) bool {
 			return tr.FirstReceipts[i].Node < tr.FirstReceipts[j].Node
 		})
-		tr.AttackerEstimates = estimateSourceFromAttackers(tr.FirstReceipts, topo.nodeIDs, src, attackerPcts, rng)
+		tr.AttackerEstimates = estimateSourceFromAttackers(tr.FirstReceipts, topo.nodeIDs, src, attackerPcts, trialRng)
 
 		res.trials = append(res.trials, tr)
 	}

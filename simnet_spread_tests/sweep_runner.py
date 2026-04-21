@@ -18,6 +18,12 @@ Output layout (in --out-dir):
 
 Resume: skip any (config, topology) whose topo-<seed>.json already exists.
 
+--extend mode: instead of skipping existing topo files, run SPREAD_SIMNET_TRIALS
+more trials on top of each one and merge the results. Missing topo files are run
+fresh. Continuation is deterministic: trial N's source and RNG are a pure
+function of (seed, N), so extending from 30 → 90 is byte-identical to running
+90 from scratch.
+
 Usage (from repo root):
     python3 simnet_spread_tests/sweep_runner.py \
         --config simnet_spread_tests/sweep_config_example.yaml \
@@ -47,6 +53,100 @@ def build_env(base_env, extra):
     env.update({k: str(v).lower() if isinstance(v, bool) else str(v)
                 for k, v in extra.items()})
     return env
+
+
+def existing_trial_count(export_path):
+    """Return the number of trials already recorded in an existing topo JSON.
+
+    Uses len(gossipsub) as the source of truth (matches len(spread) — both are
+    written together). Returns 0 if the file is missing or unreadable.
+    """
+    try:
+        with open(export_path) as f:
+            doc = json.load(f)
+        gs = doc.get("gossipsub") or []
+        sp = doc.get("spread") or []
+        # Sanity check — both scenarios should have the same count.
+        if len(gs) != len(sp):
+            print(f"   ⚠️  mismatch in {export_path}: gossipsub={len(gs)} spread={len(sp)}; "
+                  f"using min for start_trial")
+            return min(len(gs), len(sp))
+        return len(gs)
+    except Exception:
+        return 0
+
+
+def recompute_attacker_accuracy(trials):
+    """Rebuild the per-attacker-pct accuracy summary from the raw trial list.
+
+    Mirrors summarizeAttackerAccuracy() in simnet_spread_experiment_test.go.
+    Needed after merging extended trials into an existing JSON.
+    """
+    by_pct = {}
+    for tr in trials:
+        for est in tr.get("attacker_estimates", []) or []:
+            pct = est.get("attacker_pct")
+            if pct is None:
+                continue
+            bucket = by_pct.setdefault(pct, {"trials": 0, "correct": 0})
+            bucket["trials"] += 1
+            if est.get("is_correct"):
+                bucket["correct"] += 1
+    if not by_pct:
+        return None
+    out = []
+    for pct in sorted(by_pct.keys()):
+        b = by_pct[pct]
+        acc = (b["correct"] / b["trials"]) if b["trials"] > 0 else 0.0
+        out.append({
+            "attacker_pct":      pct,
+            "trials_observed":   b["trials"],
+            "correct_estimates": b["correct"],
+            "accuracy":          acc,
+        })
+    return out
+
+
+def merge_extension(existing_path, extension_path):
+    """Merge an extension export into the existing topo JSON in place.
+
+    Concatenates gossipsub + spread trial arrays, updates `trials`, and
+    recomputes the attacker_accuracy summaries. Writes atomically via a tmp
+    file in the same directory.
+    """
+    with open(existing_path) as f:
+        base = json.load(f)
+    with open(extension_path) as f:
+        ext = json.load(f)
+
+    base_gs = base.get("gossipsub") or []
+    base_sp = base.get("spread") or []
+    ext_gs  = ext.get("gossipsub")  or []
+    ext_sp  = ext.get("spread")     or []
+
+    merged_gs = base_gs + ext_gs
+    merged_sp = base_sp + ext_sp
+
+    base["gossipsub"] = merged_gs
+    base["spread"]    = merged_sp
+    base["trials"]    = len(merged_gs)
+
+    gs_acc = recompute_attacker_accuracy(merged_gs)
+    sp_acc = recompute_attacker_accuracy(merged_sp)
+    if gs_acc is not None:
+        base["gossipsub_attacker_accuracy"] = gs_acc
+    if sp_acc is not None:
+        base["spread_attacker_accuracy"]    = sp_acc
+
+    # Carry forward the extension's generated_at to reflect the latest touch.
+    if "generated_at" in ext:
+        base["generated_at"] = ext["generated_at"]
+
+    tmp = Path(str(existing_path) + ".merge.tmp")
+    with open(tmp, "w") as f:
+        json.dump(base, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, existing_path)
 
 
 def run_one(repo_dir, env, export_path, log_path, timeout_sec):
@@ -83,6 +183,11 @@ def main():
     parser.add_argument("--out-dir", required=True, help="Output directory")
     parser.add_argument("--max-retries", type=int, default=2)
     parser.add_argument("--timeout-sec", type=int, default=1500)
+    parser.add_argument("--extend", action="store_true",
+                        help="For each (config, topology) whose topo-<seed>.json already "
+                             "exists, run SPREAD_SIMNET_TRIALS more trials starting from "
+                             "where it left off and merge the results. Missing topo files "
+                             "are run fresh.")
     args = parser.parse_args()
 
     repo_dir = Path(__file__).resolve().parent.parent  # go-libp2p-pubsub root
@@ -139,6 +244,7 @@ def main():
 
     n_skipped = 0
     n_run = 0
+    n_extended = 0
     n_failed = 0
 
     t_start = time.time()
@@ -148,18 +254,29 @@ def main():
         export_path = cfg_dir / f"topo-{topo_seed}.json"
         meta_path = cfg_dir / f"topo-{topo_seed}.meta.json"
 
-        # Resume logic: skip if output already exists (and parses)
+        existing_ok = False
+        start_trial = 0
         if export_path.is_file():
             try:
                 with open(export_path) as f:
                     json.load(f)
-                n_skipped += 1
-                print(f"[{i}/{total}] SKIP {tag} topo={topo_seed}")
-                continue
+                existing_ok = True
+                start_trial = existing_trial_count(export_path)
             except Exception:
                 print(f"[{i}/{total}] re-run {tag} topo={topo_seed} (corrupted)")
 
-        print(f"[{i}/{total}] run  {tag} topo={topo_seed}")
+        # Decide action based on existing state + --extend flag.
+        is_extend = False
+        if existing_ok and not args.extend:
+            n_skipped += 1
+            print(f"[{i}/{total}] SKIP {tag} topo={topo_seed}")
+            continue
+        if existing_ok and args.extend:
+            is_extend = True
+            print(f"[{i}/{total}] extend {tag} topo={topo_seed} "
+                  f"(start_trial={start_trial}, +{trials} trials)")
+        else:
+            print(f"[{i}/{total}] run  {tag} topo={topo_seed}")
 
         # Build env — per-run overrides win over base_env.
         spread_env = {
@@ -169,8 +286,19 @@ def main():
             "SPREAD_INTER_PROB":        p_e,
             "SPREAD_INTER_FANOUT":      f_e,
             "SPREAD_SIMNET_RUN_ID":     f"{tag}_topo-{topo_seed}",
+            "SPREAD_SIMNET_START_TRIAL": start_trial,
         }
         env = build_env(base_env, spread_env)
+
+        # Fresh runs write directly to export_path. Extensions write to a temp
+        # path and then merge into the existing export_path.
+        if is_extend:
+            target_path = cfg_dir / f"topo-{topo_seed}.extend.tmp.json"
+            if target_path.exists():
+                try: target_path.unlink()
+                except: pass
+        else:
+            target_path = export_path
 
         log_path = cfg_dir / f"topo-{topo_seed}.log"
 
@@ -179,7 +307,7 @@ def main():
         last_elapsed = 0.0
         for attempt in range(args.max_retries + 1):
             success, elapsed, rc = run_one(
-                repo_dir, env, export_path,
+                repo_dir, env, target_path,
                 cfg_dir / f"topo-{topo_seed}.attempt-{attempt}.log",
                 args.timeout_sec,
             )
@@ -189,9 +317,18 @@ def main():
                 break
             print(f"   ⚠️  attempt {attempt+1} failed (rc={rc}, {elapsed:.0f}s)")
             # If the output file got partially written, delete it
-            if export_path.is_file() and not success:
-                try: export_path.unlink()
+            if target_path.is_file() and not success:
+                try: target_path.unlink()
                 except: pass
+
+        # On extend success: merge the extension JSON into the existing export.
+        if success and is_extend:
+            try:
+                merge_extension(export_path, target_path)
+                target_path.unlink()
+            except Exception as e:
+                print(f"   ⚠️  merge failed: {e}")
+                success = False
 
         # Write meta + log result
         meta = {
@@ -204,6 +341,8 @@ def main():
             "f_e":            f_e,
             "nodes":          num_nodes,
             "trials":         trials,
+            "start_trial":    start_trial,
+            "extended":       is_extend,
             "success":        success,
             "duration_s":     last_elapsed,
             "returncode":     last_rc,
@@ -215,14 +354,17 @@ def main():
             f.write(json.dumps(meta) + "\n")
 
         if success:
-            n_run += 1
+            if is_extend:
+                n_extended += 1
+            else:
+                n_run += 1
         else:
             n_failed += 1
 
     elapsed_total = time.time() - t_start
     print()
     print(f"✅ Done in {elapsed_total/60:.1f} min")
-    print(f"   skipped={n_skipped}  ran={n_run}  failed={n_failed}")
+    print(f"   skipped={n_skipped}  ran={n_run}  extended={n_extended}  failed={n_failed}")
     print()
     print(f"Charts:")
     print(f"   python3 simnet_spread_tests/sweep_plotter.py --data-dir '{out_dir}' --groups <plot_groups.yaml>")

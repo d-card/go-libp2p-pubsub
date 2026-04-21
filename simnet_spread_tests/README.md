@@ -195,6 +195,30 @@ python3 simnet_spread_tests/sweep_runner.py \
 
 Resumable: kill at any time and rerun with the same `--out-dir` — every `(config, topology)` whose `topo-<seed>.json` already exists is skipped.
 
+#### Extending an existing sweep (`--extend`)
+
+Already ran a sweep and want **more trials per config** without re-running what you have? Pass `--extend`:
+
+```bash
+python3 simnet_spread_tests/sweep_runner.py \
+    --config simnet_spread_tests/sweep_config.yaml \
+    --out-dir simnet_spread_tests/outputs/<existing_sweep> \
+    --extend
+```
+
+Behavior:
+- For each `(config, topology)` whose `topo-<seed>.json` **already exists**, the runner reads its trial count, runs `SPREAD_SIMNET_TRIALS` more trials starting from that offset, and merges the new trials into the same JSON. Trial indices stay continuous (`0..29` + `30..89`).
+- For each `(config, topology)` whose `topo-<seed>.json` **does not exist**, the runner runs a fresh batch of `SPREAD_SIMNET_TRIALS` trials — same as a normal run.
+- The start offset is computed automatically from the existing JSON. You never set `SPREAD_SIMNET_START_TRIAL` yourself.
+- Continuation is **deterministic**: trial N's source (`alive[N % len(alive)]`) and RNG seed (`seed + 7919 + N`) are pure functions of `(seed, N)`, so extending `30 → 90` is byte-identical to running `90` from scratch.
+- After each merge, the runner recomputes `gossipsub_attacker_accuracy` / `spread_attacker_accuracy` from the combined trial list.
+
+**Numerical example.** You ran with `SPREAD_SIMNET_TRIALS: 30` (30 nodes, 1 topology) and now want 60 more trials per config:
+
+1. Bump `SPREAD_SIMNET_TRIALS` to `60` in `sweep_config.yaml`.
+2. Rerun with `--extend` and the **same** `--out-dir`.
+3. Each existing topo file goes from 30 → 90 trials. Any config you added to the YAML since the first run gets a fresh 60-trial batch.
+
 Output layout:
 
 ```text
