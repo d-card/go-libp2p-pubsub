@@ -51,10 +51,26 @@ def parse_tag(tag):
     return float(m.group(1)), int(m.group(3)), float(m.group(2)), int(m.group(4))
 
 
-def load_config_data(config_dir):
-    """Load all topo-*.json files under one config dir."""
+_TOPO_SEED_RE = re.compile(r"topo-(-?\d+)\.json$")
+
+
+def load_config_data(config_dir, topology_filter=None):
+    """Load topo-*.json files under one config dir.
+
+    topology_filter: optional iterable of int seeds. If provided and non-empty,
+    only topo-<seed>.json files whose seed is in the set are loaded. Seeds in
+    the filter that have no corresponding file are silently skipped (common
+    when a sweep hasn't run every seed for every config).
+    """
+    allowed = None
+    if topology_filter:
+        allowed = {int(s) for s in topology_filter}
     exports = []
     for path in sorted(glob.glob(os.path.join(config_dir, "topo-*.json"))):
+        if allowed is not None:
+            m = _TOPO_SEED_RE.search(path)
+            if not m or int(m.group(1)) not in allowed:
+                continue
         try:
             with open(path) as f:
                 exports.append(json.load(f))
@@ -112,7 +128,7 @@ def aggregate(exports, attacker_pct=0.2):
     }
 
 
-def build_config_index(data_dir, attacker_pct):
+def build_config_index(data_dir, attacker_pct, topology_filter=None):
     """Scan <data_dir>/runs/* and return {tag: metrics}."""
     runs_dir = Path(data_dir) / "runs"
     index = {}
@@ -125,7 +141,7 @@ def build_config_index(data_dir, attacker_pct):
         params = parse_tag(tag)
         if params is None:
             continue
-        exports = load_config_data(cfg_dir)
+        exports = load_config_data(cfg_dir, topology_filter=topology_filter)
         if not exports:
             continue
         m = aggregate(exports, attacker_pct=attacker_pct)
@@ -271,11 +287,18 @@ def main():
         print("No groups found in plot config.", file=sys.stderr)
         sys.exit(1)
 
+    # Optional: filter which topology seeds feed into the plot. Empty/missing
+    # means use every topo-*.json we find (current default behavior).
+    topology_filter = plot_cfg.get("topologies") or None
+
     print(f"Loading data from: {data_dir}")
     print(f"Attacker pct:      {args.attacker_pct}")
     print(f"Stretch stat:      {args.stretch_stat}")
+    if topology_filter:
+        print(f"Topology filter:   {topology_filter}")
 
-    index = build_config_index(data_dir, args.attacker_pct)
+    index = build_config_index(data_dir, args.attacker_pct,
+                               topology_filter=topology_filter)
     print(f"Loaded metrics for {len(index)} configs.\n")
 
     print(f"Writing outputs to {out_dir}/")

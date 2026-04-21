@@ -253,7 +253,7 @@ python3 simnet_spread_tests/sweep_plotter.py \
     --groups simnet_spread_tests/plot_groups.yaml
 ```
 
-The plot groups YAML is independent from the run config — you can re-group the same data for different charts without re-running experiments. It only needs a `groups:` section; each tuple must match exactly a `(p_i, f_i, p_e, f_e)` that was run.
+The plot groups YAML is independent from the run config — you can re-group the same data for different charts without re-running experiments. It needs a `groups:` section (each tuple must match exactly a `(p_i, f_i, p_e, f_e)` that was run) and optionally a `topologies:` list to restrict which seeds feed the plot. If `topologies:` is omitted or empty, every `topo-*.json` under each config dir is used — the default.
 
 Options:
 

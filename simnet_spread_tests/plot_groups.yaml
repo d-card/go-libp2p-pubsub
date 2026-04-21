@@ -7,6 +7,11 @@
 # run (same float precision).
 #
 # Copy-paste from sweep_config.yaml's "groups" section, or hand-pick.
+#
+# Optional: `topologies:` restricts the plot to a subset of topology seeds.
+# Omit or leave empty to include every topo-*.json under each config dir.
+# Example:
+#   topologies: [1337, 1339]
 
 groups:
   A_Ce1.5:
