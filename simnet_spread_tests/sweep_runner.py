@@ -149,14 +149,43 @@ def merge_extension(existing_path, extension_path):
     os.replace(tmp, existing_path)
 
 
-def run_one(repo_dir, env, export_path, log_path, timeout_sec):
-    """Invoke `go test` once. Returns (success, duration_s, returncode)."""
+def prebuild_test_binary(repo_dir, out_path, log_path):
+    """Compile the simnet test binary once so every sweep run reuses it.
+
+    Returns the absolute path to the binary on success. Raises on failure.
+    """
+    out_path = Path(out_path).resolve()
     cmd = [
         "go", "test",
         "-tags", "simnet",
-        "-run", "TestSimnetSpreadVsGossipsubLatencyStretch",
-        "-timeout", f"{timeout_sec}s",
-        "-v", ".",
+        "-run", "^TestSimnetSpreadVsGossipsubLatencyStretch$",
+        "-c",
+        "-o", str(out_path),
+        ".",
+    ]
+    t0 = time.time()
+    with open(log_path, "w") as lf:
+        proc = subprocess.run(
+            cmd, cwd=repo_dir,
+            stdout=lf, stderr=subprocess.STDOUT,
+        )
+    elapsed = time.time() - t0
+    if proc.returncode != 0 or not out_path.is_file():
+        raise RuntimeError(
+            f"prebuild failed (rc={proc.returncode}, {elapsed:.1f}s). "
+            f"See {log_path}"
+        )
+    print(f"  prebuilt test binary in {elapsed:.1f}s → {out_path}")
+    return out_path
+
+
+def run_one(repo_dir, env, export_path, log_path, timeout_sec, test_binary):
+    """Invoke the prebuilt test binary once. Returns (success, duration_s, returncode)."""
+    cmd = [
+        str(test_binary),
+        "-test.run", "^TestSimnetSpreadVsGossipsubLatencyStretch$",
+        "-test.v",
+        "-test.timeout", f"{timeout_sec}s",
     ]
     env_with_export = dict(env)
     env_with_export["SPREAD_SIMNET_EXPORT_PATH"] = str(export_path)
@@ -206,6 +235,15 @@ def main():
 
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "runs").mkdir(exist_ok=True)
+
+    # Pre-compile the test binary once. Every run reuses it, avoiding the Go
+    # build pipeline's per-invocation overhead.
+    test_binary = prebuild_test_binary(
+        repo_dir,
+        out_dir / ".sweep_test_binary",
+        out_dir / "prebuild.log",
+    )
+
     # Copy the config to the output dir for reference
     with open(out_dir / "sweep_config.yaml", "w") as f:
         yaml.safe_dump(cfg, f, sort_keys=False)
@@ -310,6 +348,7 @@ def main():
                 repo_dir, env, target_path,
                 cfg_dir / f"topo-{topo_seed}.attempt-{attempt}.log",
                 args.timeout_sec,
+                test_binary,
             )
             last_rc = rc
             last_elapsed = elapsed

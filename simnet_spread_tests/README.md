@@ -219,6 +219,19 @@ Behavior:
 2. Rerun with `--extend` and the **same** `--out-dir`.
 3. Each existing topo file goes from 30 → 90 trials. Any config you added to the YAML since the first run gets a fresh 60-trial batch.
 
+#### Skipping a scenario
+
+Set `SPREAD_SIMNET_SKIP_SCENARIO` in the config's `env:` section (or the process env) to `gossipsub` or `spread` to run only one side. Halves the per-run cost when you only need more data on one protocol. Leave unset (or empty) to run both, the default.
+
+Caveat: if you skip one side and later extend the same out-dir with both sides enabled, the new gossipsub (or spread) data starts at the trial offset of the other side — which means trials `0..start-1` are missing for the previously-skipped side. Pick a scheme and stick with it per sweep.
+
+#### Per-run speedups
+
+Two optimizations are built in and need no configuration:
+
+- The test binary is compiled **once** at the start of a sweep (`go test -c`) and the resulting binary is reused for every run, skipping Go's build pipeline per invocation.
+- The Ethereum-like latency matrix is cached in-process by `(nodes, seed)`, so within one invocation the gossipsub and spread scenarios share the same parsed `spread_data/` files and computed weights matrix instead of redoing the decode + matrix build twice.
+
 Output layout:
 
 ```text

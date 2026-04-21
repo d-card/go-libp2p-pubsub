@@ -37,6 +37,7 @@ const (
 	SPREAD_SIMNET_ENABLE_CRASH_ENV          = "SPREAD_SIMNET_ENABLE_CRASH"
 	SPREAD_SIMNET_CRASH_PCT_ENV             = "SPREAD_SIMNET_CRASH_PCT"
 	SPREAD_SIMNET_START_TRIAL_ENV           = "SPREAD_SIMNET_START_TRIAL"
+	SPREAD_SIMNET_SKIP_SCENARIO_ENV         = "SPREAD_SIMNET_SKIP_SCENARIO" // "gossipsub" | "spread" | "" (run both)
 	SPREAD_SIMNET_NODES                     = 20               // Number of nodes
 	SPREAD_SIMNET_TRIALS                    = 500              // Number of messages published
 	SPREAD_SIMNET_WARMUP_EVERY              = 0                // Number of trials between warm-up rounds of vivaldi
@@ -148,43 +149,69 @@ func TestSimnetSpreadVsGossipsubLatencyStretch(t *testing.T) {
 	trials := envInt("SPREAD_SIMNET_TRIALS", SPREAD_SIMNET_TRIALS)
 	seed := int64(envInt("SPREAD_SIMNET_SEED", SPREAD_SIMNET_SEED))
 	startTrial := envInt(SPREAD_SIMNET_START_TRIAL_ENV, 0)
+	skipScenario := strings.ToLower(strings.TrimSpace(os.Getenv(SPREAD_SIMNET_SKIP_SCENARIO_ENV)))
+	if skipScenario != "" && skipScenario != "gossipsub" && skipScenario != "spread" {
+		t.Fatalf("%s must be empty, \"gossipsub\", or \"spread\"; got %q",
+			SPREAD_SIMNET_SKIP_SCENARIO_ENV, skipScenario)
+	}
+	runGossipsub := skipScenario != "gossipsub"
+	runSpread := skipScenario != "spread"
+
+	var gsRes, spreadRes experimentResult
+	var nodeIDsForExport []int
 
 	// Run gossipsub
-	gossipsubStartTime := time.Now()
-	gsTopo := makeEthereumLikeTopology(t, nodeCount, seed)
-	defer gsTopo.closeFn()
-	gsRes := runScenario(t, gsTopo, scenarioConfig{
-		name:             "gossipsub",
-		trials:           trials,
-		startTrial:       startTrial,
-		useSpread:        false,
-		warmupEvery:      0,
-		warmupPerPublish: 0,
-		enableCrash:      envBool(SPREAD_SIMNET_ENABLE_CRASH_ENV, false),
-		crashPct:         envFloat(SPREAD_SIMNET_CRASH_PCT_ENV, 0),
-	})
-	t.Logf("gossipsub: %d trials completed in %s", trials, time.Since(gossipsubStartTime))
+	if runGossipsub {
+		gossipsubStartTime := time.Now()
+		gsTopo := makeEthereumLikeTopology(t, nodeCount, seed)
+		defer gsTopo.closeFn()
+		gsRes = runScenario(t, gsTopo, scenarioConfig{
+			name:             "gossipsub",
+			trials:           trials,
+			startTrial:       startTrial,
+			useSpread:        false,
+			warmupEvery:      0,
+			warmupPerPublish: 0,
+			enableCrash:      envBool(SPREAD_SIMNET_ENABLE_CRASH_ENV, false),
+			crashPct:         envFloat(SPREAD_SIMNET_CRASH_PCT_ENV, 0),
+		})
+		nodeIDsForExport = gsTopo.nodeIDs
+		t.Logf("gossipsub: %d trials completed in %s", trials, time.Since(gossipsubStartTime))
+	} else {
+		t.Logf("gossipsub: SKIPPED via %s=gossipsub", SPREAD_SIMNET_SKIP_SCENARIO_ENV)
+	}
 
 	// Run spread
-	spreadStartTime := time.Now()
-	spreadTopo := makeEthereumLikeTopology(t, nodeCount, seed)
-	defer spreadTopo.closeFn()
-	spreadRes := runScenario(t, spreadTopo, scenarioConfig{
-		name:             "spread",
-		trials:           trials,
-		startTrial:       startTrial,
-		useSpread:        true,
-		warmupEvery:      envInt("SPREAD_SIMNET_WARMUP_EVERY", SPREAD_SIMNET_WARMUP_EVERY),
-		warmupPerPublish: envInt("SPREAD_SIMNET_WARMUP_ROUNDS_PER_PUBLISH", SPREAD_SIMNET_WARMUP_ROUNDS_PER_PUBLISH),
-		enableCrash:      envBool(SPREAD_SIMNET_ENABLE_CRASH_ENV, false),
-		crashPct:         envFloat(SPREAD_SIMNET_CRASH_PCT_ENV, 0),
-	})
-	t.Logf("spread: %d trials completed in %s", trials, time.Since(spreadStartTime))
+	if runSpread {
+		spreadStartTime := time.Now()
+		spreadTopo := makeEthereumLikeTopology(t, nodeCount, seed)
+		defer spreadTopo.closeFn()
+		spreadRes = runScenario(t, spreadTopo, scenarioConfig{
+			name:             "spread",
+			trials:           trials,
+			startTrial:       startTrial,
+			useSpread:        true,
+			warmupEvery:      envInt("SPREAD_SIMNET_WARMUP_EVERY", SPREAD_SIMNET_WARMUP_EVERY),
+			warmupPerPublish: envInt("SPREAD_SIMNET_WARMUP_ROUNDS_PER_PUBLISH", SPREAD_SIMNET_WARMUP_ROUNDS_PER_PUBLISH),
+			enableCrash:      envBool(SPREAD_SIMNET_ENABLE_CRASH_ENV, false),
+			crashPct:         envFloat(SPREAD_SIMNET_CRASH_PCT_ENV, 0),
+		})
+		if nodeIDsForExport == nil {
+			nodeIDsForExport = spreadTopo.nodeIDs
+		}
+		t.Logf("spread: %d trials completed in %s", trials, time.Since(spreadStartTime))
+	} else {
+		t.Logf("spread: SKIPPED via %s=spread", SPREAD_SIMNET_SKIP_SCENARIO_ENV)
+	}
 
-	t.Logf("gossipsub: %d raw observations", countDeliveries(gsRes))
-	t.Logf("spread:    %d raw observations", countDeliveries(spreadRes))
+	if runGossipsub {
+		t.Logf("gossipsub: %d raw observations", countDeliveries(gsRes))
+	}
+	if runSpread {
+		t.Logf("spread:    %d raw observations", countDeliveries(spreadRes))
+	}
 
-	if exportPath, err := maybeWriteSpreadExperimentExport(gsRes, spreadRes, gsTopo.nodeIDs, nodeCount, trials, int(seed)); err != nil {
+	if exportPath, err := maybeWriteSpreadExperimentExport(gsRes, spreadRes, nodeIDsForExport, nodeCount, trials, int(seed)); err != nil {
 		t.Fatalf("write %s: %v", SPREAD_SIMNET_EXPORT_PATH_ENV, err)
 	} else if exportPath != "" {
 		t.Logf("wrote spread experiment export to %s", exportPath)
@@ -646,8 +673,36 @@ func makeEthereumLikeTopology(t *testing.T, n int, seed int64) experimentTopolog
 	}
 }
 
+// Process-lifetime cache for the Ethereum-like latency matrix. Within a single
+// `go test` invocation this function is called once per scenario (gossipsub +
+// spread) with identical (n, seed). Decompressing pings.json.gz and rebuilding
+// the weights matrix each time is pure waste — cache the result keyed by the
+// only inputs that determine it.
+type latencyMatrixKey struct {
+	n    int
+	seed int64
+}
+
+type latencyMatrixValue struct {
+	weights [][]time.Duration
+	nodeIDs []int
+}
+
+var (
+	latencyMatrixCacheMu sync.Mutex
+	latencyMatrixCache   = make(map[latencyMatrixKey]latencyMatrixValue)
+)
+
 func makeEthereumLikeLatencyMatrix(t *testing.T, n int, seed int64) ([][]time.Duration, []int) {
 	t.Helper()
+
+	key := latencyMatrixKey{n: n, seed: seed}
+	latencyMatrixCacheMu.Lock()
+	if hit, ok := latencyMatrixCache[key]; ok {
+		latencyMatrixCacheMu.Unlock()
+		return hit.weights, hit.nodeIDs
+	}
+	latencyMatrixCacheMu.Unlock()
 
 	type nodeEntry struct {
 		ID        int     `json:"id"`
@@ -743,6 +798,10 @@ func makeEthereumLikeLatencyMatrix(t *testing.T, n int, seed int64) ([][]time.Du
 			weights[b][a] = lat
 		}
 	}
+
+	latencyMatrixCacheMu.Lock()
+	latencyMatrixCache[key] = latencyMatrixValue{weights: weights, nodeIDs: nodeIDs}
+	latencyMatrixCacheMu.Unlock()
 
 	return weights, nodeIDs
 }
