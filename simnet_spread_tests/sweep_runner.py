@@ -191,6 +191,7 @@ def run_one(repo_dir, env, export_path, log_path, timeout_sec, test_binary):
     env_with_export["SPREAD_SIMNET_EXPORT_PATH"] = str(export_path)
 
     t0 = time.time()
+    timed_out = False
     with open(log_path, "w") as lf:
         try:
             proc = subprocess.run(
@@ -201,8 +202,24 @@ def run_one(repo_dir, env, export_path, log_path, timeout_sec, test_binary):
             rc = proc.returncode
         except subprocess.TimeoutExpired:
             rc = -1
+            timed_out = True
     elapsed = time.time() - t0
-    success = (rc == 0) and Path(export_path).is_file()
+
+    # A run is successful when the export file exists AND parses as valid JSON.
+    # On non-zero return codes (including timeout) we still check the file:
+    # the Go test writes the export before teardown, and teardown can hang
+    # on network.Close (simnet wait group). In that case the export is complete
+    # even though the process gets killed — salvage it rather than discarding.
+    export_valid = False
+    if Path(export_path).is_file():
+        try:
+            with open(export_path) as f:
+                json.load(f)
+            export_valid = True
+        except Exception:
+            export_valid = False
+
+    success = export_valid and (rc == 0 or timed_out)
     return success, elapsed, rc
 
 
@@ -353,6 +370,9 @@ def main():
             last_rc = rc
             last_elapsed = elapsed
             if success:
+                if rc != 0:
+                    print(f"   ℹ️  salvaged valid export despite rc={rc} "
+                          f"(likely teardown hang after successful write)")
                 break
             print(f"   ⚠️  attempt {attempt+1} failed (rc={rc}, {elapsed:.0f}s)")
             # If the output file got partially written, delete it

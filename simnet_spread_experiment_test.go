@@ -665,10 +665,17 @@ func makeEthereumLikeTopology(t *testing.T, n int, seed int64) experimentTopolog
 		weights: weights,
 		nodeIDs: nodeIDs,
 		closeFn: func() {
-			network.Close()
+			// Close hosts BEFORE the simnet. simnet.Close() does
+			// `close(closeSignal); wg.Wait()` — if any libp2p host goroutine
+			// (QUIC read loop, pubsub heartbeat, vivaldi ticker, etc.) is
+			// mid-send on a SimConn, the sim goroutine on the other side
+			// never observes closeSignal and wg.Wait() hangs until the test
+			// timeout fires. Stopping the hosts first drains the producers
+			// so the sim wait group can actually complete.
 			for _, h := range meta.Nodes {
 				_ = h.Close()
 			}
+			network.Close()
 		},
 	}
 }
