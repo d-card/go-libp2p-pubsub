@@ -317,3 +317,44 @@ Outputs to `<data-dir>/plots/` — one scatter per (metric, stat), six total:
 | `metrics_attacker<pct>.csv`           | per-config aggregates (stretch mean/median/p90/p95/p99 + latency mean/median/p95 + accuracy) |
 
 Plot anytime — even while the runner is still going. It only reads completed runs.
+
+### 5. Per-pair latency drill-down (single config, single topology)
+
+The main plotter aggregates across topologies and configs. When you want to look at **one cell** of the sweep — one spread config on one topology — and compare every delivery against its ideal (direct-pair) latency, use `pair_latency.py`.
+
+```bash
+python3 simnet_spread_tests/pair_latency.py \
+    --data-dir simnet_spread_tests/outputs/<sweep> \
+    --tag ap<p_i>_af<f_i>_ep<p_e>_ef<f_e> \
+    --seed <topology_seed> \
+    [--gossipsub-d D,D_low,D_high]
+```
+
+Example — rho_intra=0.5, fanout_intra=4, rho_inter=0.5833, fanout_inter=6, on topology 1337:
+
+```bash
+python3 simnet_spread_tests/pair_latency.py \
+    --data-dir simnet_spread_tests/outputs/sweep_B_case \
+    --tag ap0.5_af4_ep0.5833_ef6 \
+    --seed 1337
+```
+
+Options:
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--tag` | — | spread config directory name (same format as `spread/runs/`) |
+| `--seed` | — | topology seed |
+| `--gossipsub-d` | auto | `D,D_low,D_high` — required only when multiple `gossipsub/d*_dl*_dh*/` subdirs exist |
+| `--out-dir` | `<data-dir>/analysis/<tag>_topo-<seed>/` | where to write the CSV and chart |
+
+Outputs:
+
+| File | Description |
+|------|-------------|
+| `pair_latencies.csv` | one row per delivery: `scenario, trial, source, destination, latency_ms, ideal_latency_ms, delta_ms, stretch`. Both scenarios for this (config, seed) in the same file, distinguished by the `scenario` column. |
+| `delta_vs_ideal.png` | scatter with X = ideal (direct-pair) latency [ms], Y = delta (actual − ideal) [ms], one point per delivery, colored by scenario. Zero-delta reference line drawn. |
+
+Ideal latency is reconstructed as `latency_ms / stretch` — the same direct-pair value the Go test used when computing stretch. If a delivery has `stretch == 0` (unknown pairwise weight in the dataset), the row lands in the CSV with `NaN` ideal/delta and is dropped from the chart.
+
+If the requested (tag, seed) exists for only one scenario, the script emits what it can and prints a note about the missing side.
