@@ -41,14 +41,61 @@ sns.set_theme(style="whitegrid")
 
 
 def config_tag(p_i, f_i, p_e, f_e):
-    return f"ir{p_i}_ip{p_e}_if{f_i}_ef{f_e}"
+    # ap = intra probability, af = intra fanout, ep = inter probability, ef = inter fanout.
+    return f"ap{p_i}_af{f_i}_ep{p_e}_ef{f_e}"
+
+
+_TAG_RE        = re.compile(r"^ap([\d.]+)_af(\d+)_ep([\d.]+)_ef(\d+)$")
+_LEGACY_TAG_RE = re.compile(r"^ir([\d.]+)_ip([\d.]+)_if(\d+)_ef(\d+)$")
 
 
 def parse_tag(tag):
-    m = re.match(r"ir([\d.]+)_ip([\d.]+)_if(\d+)_ef(\d+)", tag)
-    if not m:
-        return None
-    return float(m.group(1)), int(m.group(3)), float(m.group(2)), int(m.group(4))
+    """Parse a config tag into (p_i, f_i, p_e, f_e).
+
+    Accepts both the current scheme (ap/af/ep/ef, grouped order) and the legacy
+    scheme (ir/ip/if/ef, interleaved order) so old sweep output dirs remain
+    readable if anyone has them.
+    """
+    m = _TAG_RE.match(tag)
+    if m:
+        return float(m.group(1)), int(m.group(2)), float(m.group(3)), int(m.group(4))
+    m = _LEGACY_TAG_RE.match(tag)
+    if m:
+        # legacy order: p_i, p_e, f_i, f_e  → return as p_i, f_i, p_e, f_e
+        return float(m.group(1)), int(m.group(3)), float(m.group(2)), int(m.group(4))
+    return None
+
+
+def migrate_legacy_run_dirs(runs_dir):
+    """Rename any legacy-format config dirs under runs_dir to the new scheme.
+
+    Mirror of the helper in sweep_runner.py. Having it here too means a
+    colleague who pulls the new code and runs the plotter first (before
+    `sweep_runner --extend`) still gets their dirs migrated transparently.
+    No-op if nothing needs renaming.
+    """
+    runs_dir = Path(runs_dir)
+    if not runs_dir.is_dir():
+        return
+    migrated = 0
+    for entry in list(runs_dir.iterdir()):
+        if not entry.is_dir():
+            continue
+        m = _LEGACY_TAG_RE.match(entry.name)
+        if not m:
+            continue
+        p_i, p_e, f_i, f_e = m.group(1), m.group(2), m.group(3), m.group(4)
+        new_name = f"ap{p_i}_af{f_i}_ep{p_e}_ef{f_e}"
+        target = runs_dir / new_name
+        if target.exists():
+            print(f"  legacy-migrate: SKIP {entry.name} -> {new_name} (target exists)",
+                  file=sys.stderr)
+            continue
+        entry.rename(target)
+        migrated += 1
+    if migrated:
+        print(f"  legacy-migrate: renamed {migrated} dir(s) "
+              f"ir*_ip*_if*_ef* -> ap*_af*_ep*_ef*")
 
 
 _TOPO_SEED_RE = re.compile(r"topo-(-?\d+)\.json$")
@@ -93,57 +140,153 @@ def aggregate(exports, attacker_pct=0.2):
     gs_curve, sp_curve = defaultdict(list), defaultdict(list)
 
     for exp in exports:
-        for t in exp.get("gossipsub", []):
+        # `.get(..., [])` only defaults on missing keys; a present-but-null value
+        # (which the Go test emits when SPREAD_SIMNET_SKIP_SCENARIO was set)
+        # would come back as None. `... or []` normalizes both to an empty list.
+        for t in (exp.get("gossipsub") or []):
             for d in t.get("deliveries", []):
                 gs_s.append(d["stretch"])
                 gs_l.append(d["latency_ms"])
-        for t in exp.get("spread", []):
+        for t in (exp.get("spread") or []):
             for d in t.get("deliveries", []):
                 sp_s.append(d["stretch"])
                 sp_l.append(d["latency_ms"])
 
-        for e in exp.get("gossipsub_attacker_accuracy", []):
+        for e in (exp.get("gossipsub_attacker_accuracy") or []):
             p = e["attacker_pct"]
             gs_curve[p].append(e["accuracy"])
             if abs(p - attacker_pct) < 0.01:
                 gs_a.append(e["accuracy"])
-        for e in exp.get("spread_attacker_accuracy", []):
+        for e in (exp.get("spread_attacker_accuracy") or []):
             p = e["attacker_pct"]
             sp_curve[p].append(e["accuracy"])
             if abs(p - attacker_pct) < 0.01:
                 sp_a.append(e["accuracy"])
 
-    if not gs_s or not sp_s:
+    # Keep a config as long as it has any data on either side. A config with
+    # only spread (no gossipsub baseline) still plots correctly; the missing
+    # side just doesn't contribute to the baseline marker.
+    if not gs_s and not sp_s:
         return None
+
+    def _stats(values, percentiles):
+        if not values:
+            return {k: None for k in ("mean", "median", *(f"p{p}" for p in percentiles))}
+        out = {"mean": float(np.mean(values)), "median": float(np.median(values))}
+        for p in percentiles:
+            out[f"p{p}"] = float(np.percentile(values, p))
+        return out
+
+    gs_stretch = _stats(gs_s, [90, 95, 99])
+    sp_stretch = _stats(sp_s, [90, 95, 99])
+    gs_latency = _stats(gs_l, [95])
+    sp_latency = _stats(sp_l, [95])
 
     return {
         "n_topologies":       len(exports),
         "n_deliveries_gs":    len(gs_s),
         "n_deliveries_sp":    len(sp_s),
 
-        "gs_stretch_mean":    float(np.mean(gs_s)),
-        "sp_stretch_mean":    float(np.mean(sp_s)),
-        "gs_stretch_median":  float(np.median(gs_s)),
-        "sp_stretch_median":  float(np.median(sp_s)),
-        "gs_stretch_p90":     float(np.percentile(gs_s, 90)),
-        "sp_stretch_p90":     float(np.percentile(sp_s, 90)),
-        "gs_stretch_p95":     float(np.percentile(gs_s, 95)),
-        "sp_stretch_p95":     float(np.percentile(sp_s, 95)),
-        "gs_stretch_p99":     float(np.percentile(gs_s, 99)),
-        "sp_stretch_p99":     float(np.percentile(sp_s, 99)),
+        "gs_stretch_mean":    gs_stretch["mean"],
+        "sp_stretch_mean":    sp_stretch["mean"],
+        "gs_stretch_median":  gs_stretch["median"],
+        "sp_stretch_median":  sp_stretch["median"],
+        "gs_stretch_p90":     gs_stretch["p90"],
+        "sp_stretch_p90":     sp_stretch["p90"],
+        "gs_stretch_p95":     gs_stretch["p95"],
+        "sp_stretch_p95":     sp_stretch["p95"],
+        "gs_stretch_p99":     gs_stretch["p99"],
+        "sp_stretch_p99":     sp_stretch["p99"],
 
-        "gs_latency_mean":    float(np.mean(gs_l)),
-        "sp_latency_mean":    float(np.mean(sp_l)),
-        "gs_latency_median":  float(np.median(gs_l)),
-        "sp_latency_median":  float(np.median(sp_l)),
-        "gs_latency_p95":     float(np.percentile(gs_l, 95)),
-        "sp_latency_p95":     float(np.percentile(sp_l, 95)),
+        "gs_latency_mean":    gs_latency["mean"],
+        "sp_latency_mean":    sp_latency["mean"],
+        "gs_latency_median":  gs_latency["median"],
+        "sp_latency_median":  sp_latency["median"],
+        "gs_latency_p95":     gs_latency["p95"],
+        "sp_latency_p95":     sp_latency["p95"],
 
         "gs_accuracy":        float(np.mean(gs_a)) if gs_a else None,
         "sp_accuracy":        float(np.mean(sp_a)) if sp_a else None,
 
         "gs_accuracy_curve":  {float(k): float(np.mean(v)) for k, v in gs_curve.items()},
         "sp_accuracy_curve":  {float(k): float(np.mean(v)) for k, v in sp_curve.items()},
+    }
+
+
+def build_global_gs_baseline(data_dir, attacker_pct, topology_filter=None):
+    """Compute one gossipsub baseline by pooling every gs delivery across the
+    whole sweep, instead of averaging per-config means.
+
+    Gossipsub output only depends on (nodes, seed, trials), not on the swept
+    spread config. Pooling raw deliveries naturally weights each (seed, trial)
+    the same regardless of how many config dirs happen to hold gs data for it,
+    which gives a statistically fair baseline when gs coverage is uneven.
+
+    Returns a dict with keys matching the per-config aggregate shape
+    (`gs_stretch_mean`, `gs_latency_p95`, `gs_accuracy`, …) or None if no
+    gossipsub data exists anywhere in the sweep.
+    """
+    runs_dir = Path(data_dir) / "runs"
+    if not runs_dir.is_dir():
+        return None
+
+    # Dedup gs data per (seed). Same seed can appear under many config dirs
+    # with identical gossipsub output (topology-only), so count it once and
+    # keep the longest trial list we've seen (captures extensions).
+    gs_by_seed = {}
+    for cfg_dir in sorted(runs_dir.iterdir()):
+        if not cfg_dir.is_dir():
+            continue
+        for path in sorted(glob.glob(os.path.join(cfg_dir, "topo-*.json"))):
+            m = _TOPO_SEED_RE.search(path)
+            if not m:
+                continue
+            seed = int(m.group(1))
+            if topology_filter and seed not in {int(s) for s in topology_filter}:
+                continue
+            try:
+                with open(path) as f:
+                    doc = json.load(f)
+            except Exception:
+                continue
+            gs = doc.get("gossipsub") or []
+            if not gs:
+                continue
+            prev = gs_by_seed.get(seed)
+            if prev is None or len(gs) > len(prev["gs"]):
+                gs_by_seed[seed] = {"gs": gs, "acc": doc.get("gossipsub_attacker_accuracy") or []}
+
+    if not gs_by_seed:
+        return None
+
+    stretch, latency = [], []
+    acc_vals, acc_curve = [], defaultdict(list)
+    for _, bundle in gs_by_seed.items():
+        for t in bundle["gs"]:
+            for d in t.get("deliveries", []):
+                stretch.append(d["stretch"])
+                latency.append(d["latency_ms"])
+        for e in bundle["acc"]:
+            p = e["attacker_pct"]
+            acc_curve[p].append(e["accuracy"])
+            if abs(p - attacker_pct) < 0.01:
+                acc_vals.append(e["accuracy"])
+
+    def _pct(values, p):
+        return float(np.percentile(values, p)) if values else None
+
+    return {
+        "n_seeds":            len(gs_by_seed),
+        "n_deliveries":       len(stretch),
+        "gs_stretch_mean":    float(np.mean(stretch))   if stretch else None,
+        "gs_stretch_median":  float(np.median(stretch)) if stretch else None,
+        "gs_stretch_p90":     _pct(stretch, 90),
+        "gs_stretch_p95":     _pct(stretch, 95),
+        "gs_stretch_p99":     _pct(stretch, 99),
+        "gs_latency_mean":    float(np.mean(latency))   if latency else None,
+        "gs_latency_median": float(np.median(latency))  if latency else None,
+        "gs_latency_p95":     _pct(latency, 95),
+        "gs_accuracy":        float(np.mean(acc_vals))  if acc_vals else None,
     }
 
 
@@ -195,7 +338,8 @@ def write_metrics_csv(index, out_path):
 
 def chart_anon_vs_metric(index, groups, out_path,
                          metric="stretch", stat="mean",
-                         sort_key="p_i"):
+                         sort_key="p_i",
+                         gs_baseline=None):
     """
     Scatter: X = Spread `<metric>_<stat>`, Y = Spread deanon accuracy.
     One connected line per group. Points sorted by `sort_key` within a group.
@@ -213,11 +357,22 @@ def chart_anon_vs_metric(index, groups, out_path,
     palette = sns.color_palette("tab10", n_colors=max(len(groups), 1))
     markers = ["o", "s", "D", "^", "v", "P", "X", "*", "h", "<"]
 
-    # Plot GossipSub baseline (averaged across all configs we have)
-    all_gs_x    = [m[gs_x_key] for m in index.values() if m.get(gs_x_key) is not None]
-    all_gs_anon = [m["gs_accuracy"] for m in index.values() if m["gs_accuracy"] is not None]
-    if all_gs_x and all_gs_anon:
-        ax.scatter(np.mean(all_gs_x), np.mean(all_gs_anon),
+    # Plot GossipSub baseline. Prefer the globally-pooled baseline computed
+    # once across the whole sweep (unbiased when gs coverage is uneven across
+    # configs). Fall back to averaging per-config means if no pooled baseline
+    # was provided.
+    baseline_x = baseline_y = None
+    if gs_baseline is not None:
+        baseline_x = gs_baseline.get(gs_x_key)
+        baseline_y = gs_baseline.get("gs_accuracy")
+    if baseline_x is None or baseline_y is None:
+        all_gs_x    = [m[gs_x_key] for m in index.values() if m.get(gs_x_key) is not None]
+        all_gs_anon = [m["gs_accuracy"] for m in index.values() if m.get("gs_accuracy") is not None]
+        if all_gs_x and all_gs_anon:
+            baseline_x = float(np.mean(all_gs_x))
+            baseline_y = float(np.mean(all_gs_anon))
+    if baseline_x is not None and baseline_y is not None:
+        ax.scatter(baseline_x, baseline_y,
                    color="black", marker="*", s=260, zorder=10,
                    label="GossipSub baseline", edgecolors="white", linewidths=1.2)
 
@@ -321,9 +476,22 @@ def main():
     if topology_filter:
         print(f"Topology filter:   {topology_filter}")
 
+    # Rename any legacy-format config dirs in place before indexing, so old
+    # sweep outputs are picked up by the new-format scans downstream.
+    migrate_legacy_run_dirs(data_dir / "runs")
+
     index = build_config_index(data_dir, args.attacker_pct,
                                topology_filter=topology_filter)
-    print(f"Loaded metrics for {len(index)} configs.\n")
+    print(f"Loaded metrics for {len(index)} configs.")
+
+    gs_baseline = build_global_gs_baseline(data_dir, args.attacker_pct,
+                                           topology_filter=topology_filter)
+    if gs_baseline is not None:
+        print(f"Pooled gossipsub baseline: {gs_baseline['n_seeds']} seeds, "
+              f"{gs_baseline['n_deliveries']} deliveries")
+    else:
+        print("No gossipsub data found — baseline marker will be omitted.")
+    print()
 
     print(f"Writing outputs to {out_dir}/")
     write_metrics_csv(index, out_dir / f"metrics_attacker{args.attacker_pct}.csv")
@@ -344,6 +512,7 @@ def main():
             out_dir / f"scatter_anon_vs_{metric}_{stat}.png",
             metric=metric, stat=stat,
             sort_key=args.sort_key,
+            gs_baseline=gs_baseline,
         )
 
     print("\nDone.")

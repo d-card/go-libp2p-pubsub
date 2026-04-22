@@ -33,6 +33,7 @@ Usage (from repo root):
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -42,8 +43,48 @@ import yaml
 
 
 def config_tag(p_i, f_i, p_e, f_e):
-    """Canonical tag. Matches existing convention (ir=rho_i, ip=prob_e, if=fanout_i, ef=fanout_e)."""
-    return f"ir{p_i}_ip{p_e}_if{f_i}_ef{f_e}"
+    """Canonical tag.
+
+    Layout: intra block first (ap = intra probability, af = intra fanout),
+    then inter block (ep = inter probability, ef = inter fanout).
+    """
+    return f"ap{p_i}_af{f_i}_ep{p_e}_ef{f_e}"
+
+
+# Legacy tag format (kept for one-way backward compat): ir<p_i>_ip<p_e>_if<f_i>_ef<f_e>.
+# Different prefix *and* different field order (interleaved vs. grouped).
+_LEGACY_TAG_RE = re.compile(r"^ir([\d.]+)_ip([\d.]+)_if(\d+)_ef(\d+)$")
+
+
+def migrate_legacy_run_dirs(runs_dir):
+    """Rename any legacy-format config dirs under runs_dir to the new scheme.
+
+    Safe to call on any directory: if no legacy dirs exist, it's a no-op.
+    If a new-format dir already exists alongside an old one for the same
+    config (shouldn't happen in practice, but be paranoid), the legacy dir is
+    left alone and a warning is printed — no destructive merge.
+    """
+    runs_dir = Path(runs_dir)
+    if not runs_dir.is_dir():
+        return
+    migrated = 0
+    for entry in list(runs_dir.iterdir()):
+        if not entry.is_dir():
+            continue
+        m = _LEGACY_TAG_RE.match(entry.name)
+        if not m:
+            continue
+        p_i, p_e, f_i, f_e = m.group(1), m.group(2), m.group(3), m.group(4)
+        new_name = f"ap{p_i}_af{f_i}_ep{p_e}_ef{f_e}"
+        target = runs_dir / new_name
+        if target.exists():
+            print(f"  legacy-migrate: SKIP {entry.name} -> {new_name} (target exists)")
+            continue
+        entry.rename(target)
+        migrated += 1
+    if migrated:
+        print(f"  legacy-migrate: renamed {migrated} dir(s) "
+              f"ir*_ip*_if*_ef* -> ap*_af*_ep*_ef*")
 
 
 def build_env(base_env, extra):
@@ -252,6 +293,10 @@ def main():
 
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "runs").mkdir(exist_ok=True)
+
+    # One-shot migration of legacy-format config dirs (ir*_ip*_if*_ef*) produced
+    # before the tag scheme changed. Safe no-op when nothing needs renaming.
+    migrate_legacy_run_dirs(out_dir / "runs")
 
     # Pre-compile the test binary once. Every run reuses it, avoiding the Go
     # build pipeline's per-invocation overhead.
