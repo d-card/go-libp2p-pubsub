@@ -114,54 +114,79 @@ def main():
     if not sampled.empty:
         out_groups[f"C_f{fi}_f{fe}"] = [row_to_cfg(r) for _, r in sampled.iterrows()]
 
-    # Group D: diagonal walk from high-fanout/low-prob to low-fanout/high-prob
-    base_sorted = base.copy()
-    base_sorted["fan_sum"]  = base_sorted["f_i"] + base_sorted["f_e"]
-    base_sorted["prob_sum"] = base_sorted["p_i"] + base_sorted["p_e"]
-    base_sorted["diag"] = base_sorted["fan_sum"] - 10 * base_sorted["prob_sum"]
-    sampled = evenly_spaced(base_sorted, "diag", n)
-    if not sampled.empty:
-        out_groups["D_fanouts_vs_bernoullis"] = [row_to_cfg(r) for _, r in sampled.iterrows()]
+    # Group D: hand-picked E=6 diagonal — fanouts rise 3→8, probabilities fall,
+    # intra contribution (Ci) grows 3.0→5.0 while inter (Ce) shrinks 3.0→1.0.
+    out_groups["D_fanouts_vs_bernoullis"] = [
+        [1.0,    3, 1.0,   3],
+        [0.8,    4, 0.65,  4],
+        [0.7,    5, 0.44,  5],
+        [0.64,   6, 0.3,   6],
+        [0.6,    7, 0.2,   7],
+        [0.5714, 8, 0.125, 8],
+    ]
+
+    # Group B_Ci3.5: hand-picked companion to the algorithmic B_Ci{1.5,2.0,2.5}
+    # lines. p_i=0.5, f_i=5 held constant; p_e decreases as f_e increases.
+    # NOTE: these entries sit at E=5.5 (not E=6 like the other B groups).
+    out_groups["B_Ci3.5"] = [
+        [0.5, 5, 0.625,  4],
+        [0.5, 5, 0.5,    5],
+        [0.5, 5, 0.4167, 6],
+        [0.5, 5, 0.3571, 7],
+        [0.5, 5, 0.3125, 8],
+        [0.5, 5, 0.2778, 9],
+    ]
 
     config = {
+        "extend":       False,
+
         "topologies":   [int(x) for x in args.topologies.split(",")],
 
-        "env": {
-            "SPREAD_SIMNET_NODES":                    args.nodes,
-            "SPREAD_SIMNET_TRIALS":                   args.trials,
-            "SPREAD_SIMNET_LINK_MIBPS":               20,
-            "SPREAD_SIMNET_SCENARIO_TIMEOUT_MS":      600000,
-            "SPREAD_SIMNET_ENABLE_CRASH":             False,
-            "SPREAD_SIMNET_CRASH_PCT":                0.0,
-            "SPREAD_SIMNET_WARMUP_EVERY":             0,
-            "SPREAD_SIMNET_WARMUP_ROUNDS_PER_PUBLISH": 1,
-
-            # Clustering
-            "SPREAD_CLUSTER_PCT":                     0.25,
-            "SPREAD_NUM_RINGS":                       4,
-            "SPREAD_FALLBACK_THRESHOLD":              3,
-            "SPREAD_DUPLICATE_REPROPAGATION":         5,
-            "SPREAD_USE_ANGULAR_INTER_PEERS":         True,
-
-            # Vivaldi
-            "SPREAD_CC":                              0.25,
-            "SPREAD_CE":                              0.25,
-            "SPREAD_NEWTON":                          False,
-            "SPREAD_OUTLIER_THRESHOLD":               0,
-            "SPREAD_SAMPLES":                         1,
-            "SPREAD_INTERVAL_MS":                     150,
-            "SPREAD_NEIGHBOR_SET_SIZE":               24,
-            "SPREAD_IN1_THRESHOLD_MS":                20,
-            "SPREAD_IN2_THRESHOLD_MS":                35,
-            "SPREAD_IN3_MADK_RANDOM":                 5,
-            "SPREAD_IN3_MADK_CLOSE":                  8,
-            "SPREAD_IN3_MIN_SAMPLES":                 4,
-
-            # Attackers
-            "SPREAD_ATTACKER_PCTS":                   "0.1,0.2,0.3,0.4,0.5",
+        "simnet": {
+            "nodes":               args.nodes,
+            "trials":              args.trials,
+            "link_mibps":          20,
+            "scenario_timeout_ms": 600000,
+            "enable_crash":        False,
+            "crash_pct":           0.0,
+            "attacker_pcts":       [0.1, 0.2, 0.3, 0.4, 0.5],
         },
 
-        "groups": out_groups,
+        "gossipsub": {
+            "enabled": True,
+            "D":       6,
+            "D_low":   5,
+            "D_high":  12,
+        },
+
+        "spread": {
+            "enabled":                    True,
+            "warmup_every":               0,
+            "warmup_rounds_per_publish":  1,
+            # Pass-through for SPREAD_* implementation knobs the Go test reads.
+            "env": {
+                # Clustering
+                "SPREAD_CLUSTER_PCT":             0.25,
+                "SPREAD_NUM_RINGS":               4,
+                "SPREAD_FALLBACK_THRESHOLD":      3,
+                "SPREAD_DUPLICATE_REPROPAGATION": 5,
+                "SPREAD_USE_ANGULAR_INTER_PEERS": True,
+                # Vivaldi
+                "SPREAD_CC":                      0.25,
+                "SPREAD_CE":                      0.25,
+                "SPREAD_NEWTON":                  False,
+                "SPREAD_OUTLIER_THRESHOLD":       0,
+                "SPREAD_SAMPLES":                 1,
+                "SPREAD_INTERVAL_MS":             150,
+                "SPREAD_NEIGHBOR_SET_SIZE":       24,
+                "SPREAD_IN1_THRESHOLD_MS":        20,
+                "SPREAD_IN2_THRESHOLD_MS":        35,
+                "SPREAD_IN3_MADK_RANDOM":         5,
+                "SPREAD_IN3_MADK_CLOSE":          8,
+                "SPREAD_IN3_MIN_SAMPLES":         4,
+            },
+            "groups": out_groups,
+        },
     }
 
     out_path = Path(args.out)
@@ -178,14 +203,17 @@ def main():
         yaml.dump(config, f, Dumper=_Dumper, sort_keys=False, default_flow_style=False)
 
     total_unique = len({tuple(c) for cfgs in out_groups.values() for c in cfgs})
-    total_runs = total_unique * len(config["topologies"])
+    n_topologies = len(config["topologies"])
+    spread_runs = total_unique * n_topologies
+    gs_runs     = n_topologies
     print(f"Wrote {out_path}")
-    print(f"  Groups:            {len(out_groups)}")
+    print(f"  Groups:                 {len(out_groups)}")
     for name, cfgs in out_groups.items():
         print(f"    {name:<30} {len(cfgs)} configs")
-    print(f"  Unique configs:    {total_unique}")
-    print(f"  Topologies:        {len(config['topologies'])}")
-    print(f"  Total runs needed: {total_runs}")
+    print(f"  Unique spread configs:  {total_unique}")
+    print(f"  Topologies:             {n_topologies}")
+    print(f"  Estimated gossipsub runs: {gs_runs}")
+    print(f"  Estimated spread runs:    {spread_runs}")
 
 
 if __name__ == "__main__":

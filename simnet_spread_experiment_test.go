@@ -38,6 +38,9 @@ const (
 	SPREAD_SIMNET_CRASH_PCT_ENV             = "SPREAD_SIMNET_CRASH_PCT"
 	SPREAD_SIMNET_START_TRIAL_ENV           = "SPREAD_SIMNET_START_TRIAL"
 	SPREAD_SIMNET_SKIP_SCENARIO_ENV         = "SPREAD_SIMNET_SKIP_SCENARIO" // "gossipsub" | "spread" | "" (run both)
+	GOSSIPSUB_D_ENV                         = "GOSSIPSUB_D"
+	GOSSIPSUB_D_LOW_ENV                     = "GOSSIPSUB_D_LOW"
+	GOSSIPSUB_D_HIGH_ENV                    = "GOSSIPSUB_D_HIGH"
 	SPREAD_SIMNET_NODES                     = 20               // Number of nodes
 	SPREAD_SIMNET_TRIALS                    = 500              // Number of messages published
 	SPREAD_SIMNET_WARMUP_EVERY              = 0                // Number of trials between warm-up rounds of vivaldi
@@ -251,6 +254,18 @@ func runScenario(t *testing.T, topo experimentTopology, cfg scenarioConfig) expe
 			p := DefaultGossipSubParams()
 			p.HeartbeatInitialDelay = 300 * time.Millisecond
 			p.HeartbeatInterval = 1000 * time.Millisecond
+			// Optional mesh-degree overrides. Defaults come from DefaultGossipSubParams
+			// (D=6, Dlo=5, Dhi=12). These apply to both scenarios — spread inherits
+			// the underlying gossipsub mesh shape.
+			if v := envInt(GOSSIPSUB_D_ENV, -1); v >= 0 {
+				p.D = v
+			}
+			if v := envInt(GOSSIPSUB_D_LOW_ENV, -1); v >= 0 {
+				p.Dlo = v
+			}
+			if v := envInt(GOSSIPSUB_D_HIGH_ENV, -1); v >= 0 {
+				p.Dhi = v
+			}
 			return p
 		}()),
 	}

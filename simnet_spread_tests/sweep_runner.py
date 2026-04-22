@@ -2,31 +2,47 @@
 """
 Sweep runner — execute a parameter sweep over multiple network topologies.
 
-Input: a YAML config describing:
-  topologies      — list of seeds (one per network topology)
-  env             — dict of SPREAD_* env vars passed through to the Go test
-                    (must include SPREAD_SIMNET_NODES and SPREAD_SIMNET_TRIALS)
-  groups          — dict of group_name -> list of [p_i, f_i, p_e, f_e] configs
+Config (YAML) shape:
+  extend: bool                  # extend existing outputs instead of skipping
+  topologies: [int, ...]        # list of simnet seeds
+  simnet:                       # global simulation knobs (apply to both scenarios)
+    nodes, trials, link_mibps, scenario_timeout_ms,
+    enable_crash, crash_pct, attacker_pcts: [float, ...]
+  gossipsub:                    # GossipSub baseline — one file per seed
+    enabled: bool
+    D, D_low, D_high: int
+  spread:                       # SPREAD sweep — per (group config × seed)
+    enabled: bool
+    warmup_every, warmup_rounds_per_publish: int
+    groups:
+      <group_name>:
+        - [p_i, f_i, p_e, f_e]
+        ...
 
-Output layout (in --out-dir):
-  sweep_config.yaml           — copy of input
-  runs/
-    <config_tag>/
-      topo-<seed>.json        — raw per-run export from the Go test
-      topo-<seed>.meta.json   — timestamps, duration, group memberships
-  results.jsonl               — append-only log of every completed run
+Output layout (under --out-dir):
+  sweep_config.yaml                              (copy of input)
+  prebuild.log  .sweep_test_binary
+  results.jsonl                                  (append-only run log)
+  gossipsub/
+    d<D>_dl<D_low>_dh<D_high>/
+      topo-<seed>.json            — only gossipsub data
+      topo-<seed>.meta.json
+  spread/
+    runs/
+      ap<p_i>_af<f_i>_ep<p_e>_ef<f_e>/
+        topo-<seed>.json          — only spread data
+        topo-<seed>.meta.json
 
-Resume: skip any (config, topology) whose topo-<seed>.json already exists.
-
---extend mode: instead of skipping existing topo files, run SPREAD_SIMNET_TRIALS
-more trials on top of each one and merge the results. Missing topo files are run
-fresh. Continuation is deterministic: trial N's source and RNG are a pure
-function of (seed, N), so extending from 30 → 90 is byte-identical to running
-90 from scratch.
+Resume semantics:
+  extend=false → skip any (scenario, …) whose export file already exists.
+  extend=true  → for each existing file, run `trials` more trials starting from
+                 where it left off and merge. Missing files are run fresh.
+                 Continuation is deterministic: trial N's source + RNG are a
+                 pure function of (seed, N).
 
 Usage (from repo root):
     python3 simnet_spread_tests/sweep_runner.py \
-        --config simnet_spread_tests/sweep_config_example.yaml \
+        --config simnet_spread_tests/sweep_config.yaml \
         --out-dir simnet_spread_tests/outputs/sweep_$(date +%Y%m%d_%H%M%S)
 """
 
@@ -94,6 +110,89 @@ def build_env(base_env, extra):
     env.update({k: str(v).lower() if isinstance(v, bool) else str(v)
                 for k, v in extra.items()})
     return env
+
+
+# ---- Structured config → env mapping --------------------------------------
+
+_ALLOWED_TOP_KEYS      = {"extend", "topologies", "simnet", "gossipsub", "spread"}
+_ALLOWED_SIMNET_KEYS   = {
+    "nodes", "trials", "link_mibps", "scenario_timeout_ms",
+    "enable_crash", "crash_pct", "attacker_pcts",
+}
+_ALLOWED_GOSSIPSUB_KEYS = {"enabled", "D", "D_low", "D_high"}
+_ALLOWED_SPREAD_KEYS    = {"enabled", "warmup_every", "warmup_rounds_per_publish",
+                            "groups", "env"}
+
+
+def validate_config(cfg):
+    """Raise ValueError on missing/unknown keys so typos surface early."""
+    if not isinstance(cfg, dict):
+        raise ValueError("sweep config must be a mapping at the top level")
+    unknown = set(cfg) - _ALLOWED_TOP_KEYS
+    if unknown:
+        raise ValueError(f"unknown top-level keys: {sorted(unknown)}")
+    if "topologies" not in cfg or not cfg["topologies"]:
+        raise ValueError("`topologies` is required and must be non-empty")
+    if "simnet" not in cfg:
+        raise ValueError("`simnet:` section is required")
+    unknown = set(cfg["simnet"]) - _ALLOWED_SIMNET_KEYS
+    if unknown:
+        raise ValueError(f"unknown simnet keys: {sorted(unknown)}")
+    for required in ("nodes", "trials"):
+        if required not in cfg["simnet"]:
+            raise ValueError(f"`simnet.{required}` is required")
+    gs = cfg.get("gossipsub") or {}
+    sp = cfg.get("spread") or {}
+    if not gs.get("enabled") and not sp.get("enabled"):
+        raise ValueError("at least one of gossipsub.enabled / spread.enabled must be true")
+    if gs:
+        unknown = set(gs) - _ALLOWED_GOSSIPSUB_KEYS
+        if unknown:
+            raise ValueError(f"unknown gossipsub keys: {sorted(unknown)}")
+    if sp:
+        unknown = set(sp) - _ALLOWED_SPREAD_KEYS
+        if unknown:
+            raise ValueError(f"unknown spread keys: {sorted(unknown)}")
+
+
+def simnet_env(simnet_cfg):
+    """Convert the simnet section into the pass-through env vars the Go test reads."""
+    e = {
+        "SPREAD_SIMNET_NODES":              simnet_cfg["nodes"],
+        "SPREAD_SIMNET_TRIALS":             simnet_cfg["trials"],
+    }
+    if "link_mibps" in simnet_cfg:
+        e["SPREAD_SIMNET_LINK_MIBPS"] = simnet_cfg["link_mibps"]
+    if "scenario_timeout_ms" in simnet_cfg:
+        e["SPREAD_SIMNET_SCENARIO_TIMEOUT_MS"] = simnet_cfg["scenario_timeout_ms"]
+    if "enable_crash" in simnet_cfg:
+        e["SPREAD_SIMNET_ENABLE_CRASH"] = simnet_cfg["enable_crash"]
+    if "crash_pct" in simnet_cfg:
+        e["SPREAD_SIMNET_CRASH_PCT"] = simnet_cfg["crash_pct"]
+    pcts = simnet_cfg.get("attacker_pcts")
+    if pcts:
+        e["SPREAD_ATTACKER_PCTS"] = ",".join(str(x) for x in pcts)
+    return e
+
+
+def gossipsub_subdir(gs_cfg):
+    """Return `d<D>_dl<D_low>_dh<D_high>`, using Go-side defaults (6/5/12) when absent."""
+    D      = gs_cfg.get("D", 6)
+    D_low  = gs_cfg.get("D_low", 5)
+    D_high = gs_cfg.get("D_high", 12)
+    return f"d{D}_dl{D_low}_dh{D_high}"
+
+
+def gossipsub_env(gs_cfg):
+    """Env vars for the Go-side gossipsub D params. Only emitted when explicitly set."""
+    e = {}
+    if "D" in gs_cfg:
+        e["GOSSIPSUB_D"] = gs_cfg["D"]
+    if "D_low" in gs_cfg:
+        e["GOSSIPSUB_D_LOW"] = gs_cfg["D_low"]
+    if "D_high" in gs_cfg:
+        e["GOSSIPSUB_D_HIGH"] = gs_cfg["D_high"]
+    return e
 
 
 def existing_trial_count(export_path):
@@ -264,211 +363,267 @@ def run_one(repo_dir, env, export_path, log_path, timeout_sec, test_binary):
     return success, elapsed, rc
 
 
+def dispatch_one(*, label, repo_dir, target_dir, base_name,
+                 extra_env, base_env, test_binary, trials,
+                 extend, max_retries, timeout_sec,
+                 results_log, meta_extras, counters):
+    """Run (or extend) one scenario invocation into `target_dir/base_name.json`.
+
+    Handles: existence check → start_trial computation → run/retry → merge (on
+    extend) → meta.json write → results.jsonl append → counter update.
+    Returns None; mutates `counters` (dict with keys skipped/ran/extended/failed).
+    """
+    target_dir.mkdir(parents=True, exist_ok=True)
+    export_path = target_dir / f"{base_name}.json"
+    meta_path   = target_dir / f"{base_name}.meta.json"
+
+    existing_ok = False
+    start_trial = 0
+    if export_path.is_file():
+        try:
+            with open(export_path) as f:
+                json.load(f)
+            existing_ok = True
+            start_trial = existing_trial_count(export_path)
+        except Exception:
+            print(f"  [{label}] re-run (corrupted existing file)")
+
+    is_extend = False
+    if existing_ok and not extend:
+        print(f"  [{label}] SKIP (exists)")
+        counters["skipped"] += 1
+        return
+    if existing_ok and extend:
+        is_extend = True
+        print(f"  [{label}] extend (start_trial={start_trial}, +{trials} trials)")
+    else:
+        print(f"  [{label}] run")
+
+    # Fresh runs write straight to the final path; extends go to a temp file
+    # then merge into the existing export.
+    if is_extend:
+        target_path = target_dir / f"{base_name}.extend.tmp.json"
+        if target_path.exists():
+            try: target_path.unlink()
+            except: pass
+    else:
+        target_path = export_path
+
+    env = build_env(base_env, {
+        **extra_env,
+        "SPREAD_SIMNET_START_TRIAL": start_trial,
+    })
+
+    success = False
+    last_rc = None
+    last_elapsed = 0.0
+    for attempt in range(max_retries + 1):
+        success, elapsed, rc = run_one(
+            repo_dir, env, target_path,
+            target_dir / f"{base_name}.attempt-{attempt}.log",
+            timeout_sec,
+            test_binary,
+        )
+        last_rc = rc
+        last_elapsed = elapsed
+        if success:
+            if rc != 0:
+                print(f"     ℹ️  salvaged valid export despite rc={rc} "
+                      f"(likely teardown hang)")
+            break
+        print(f"     ⚠️  attempt {attempt+1} failed (rc={rc}, {elapsed:.0f}s)")
+        if target_path.is_file() and not success:
+            try: target_path.unlink()
+            except: pass
+
+    if success and is_extend:
+        try:
+            merge_extension(export_path, target_path)
+            target_path.unlink()
+        except Exception as e:
+            print(f"     ⚠️  merge failed: {e}")
+            success = False
+
+    meta = {
+        **meta_extras,
+        "trials":       trials,
+        "start_trial":  start_trial,
+        "extended":     is_extend,
+        "success":      success,
+        "duration_s":   last_elapsed,
+        "returncode":   last_rc,
+        "timestamp":    time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+    with open(meta_path, "w") as f:
+        json.dump(meta, f, indent=2)
+    with open(results_log, "a") as f:
+        f.write(json.dumps(meta) + "\n")
+
+    if success:
+        counters["extended" if is_extend else "ran"] += 1
+    else:
+        counters["failed"] += 1
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True, help="Path to sweep config YAML")
     parser.add_argument("--out-dir", required=True, help="Output directory")
     parser.add_argument("--max-retries", type=int, default=2)
     parser.add_argument("--timeout-sec", type=int, default=1500)
-    parser.add_argument("--extend", action="store_true",
-                        help="For each (config, topology) whose topo-<seed>.json already "
-                             "exists, run SPREAD_SIMNET_TRIALS more trials starting from "
-                             "where it left off and merge the results. Missing topo files "
-                             "are run fresh.")
     args = parser.parse_args()
 
-    repo_dir = Path(__file__).resolve().parent.parent  # go-libp2p-pubsub root
+    repo_dir    = Path(__file__).resolve().parent.parent  # go-libp2p-pubsub root
     config_path = Path(args.config).resolve()
-    out_dir = Path(args.out_dir).resolve()
+    out_dir     = Path(args.out_dir).resolve()
 
     with open(config_path) as f:
         cfg = yaml.safe_load(f)
 
-    topologies = cfg.get("topologies") or [1337]
-    base_env = cfg.get("env") or {}
-    groups = cfg.get("groups") or {}
+    try:
+        validate_config(cfg)
+    except ValueError as e:
+        print(f"config error: {e}", file=sys.stderr)
+        sys.exit(2)
 
-    num_nodes = int(base_env.get("SPREAD_SIMNET_NODES", 30))
-    trials = int(base_env.get("SPREAD_SIMNET_TRIALS", num_nodes))
+    topologies   = list(cfg["topologies"])
+    simnet_cfg   = cfg["simnet"]
+    gs_cfg       = cfg.get("gossipsub") or {}
+    sp_cfg       = cfg.get("spread") or {}
+    extend       = bool(cfg.get("extend", False))
+    trials       = int(simnet_cfg["trials"])
+    num_nodes    = int(simnet_cfg["nodes"])
+
+    gs_enabled = bool(gs_cfg.get("enabled"))
+    sp_enabled = bool(sp_cfg.get("enabled"))
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "runs").mkdir(exist_ok=True)
 
-    # One-shot migration of legacy-format config dirs (ir*_ip*_if*_ef*) produced
-    # before the tag scheme changed. Safe no-op when nothing needs renaming.
-    migrate_legacy_run_dirs(out_dir / "runs")
-
-    # Pre-compile the test binary once. Every run reuses it, avoiding the Go
-    # build pipeline's per-invocation overhead.
     test_binary = prebuild_test_binary(
         repo_dir,
         out_dir / ".sweep_test_binary",
         out_dir / "prebuild.log",
     )
 
-    # Copy the config to the output dir for reference
+    # Snapshot the config for later reference / debugging.
     with open(out_dir / "sweep_config.yaml", "w") as f:
         yaml.safe_dump(cfg, f, sort_keys=False)
 
     results_log = out_dir / "results.jsonl"
+    base_env = simnet_env(simnet_cfg)
 
-    # Build work list: each item = (group_name, (p_i,f_i,p_e,f_e), topo_seed)
-    # Iterate by topology first so a partial run produces balanced data.
-    work = []
-    config_to_groups = {}  # tag -> set of groups it belongs to
-    for group_name, cfg_list in groups.items():
-        for spread_cfg in cfg_list:
-            p_i, f_i, p_e, f_e = spread_cfg
-            tag = config_tag(p_i, f_i, p_e, f_e)
-            config_to_groups.setdefault(tag, set()).add(group_name)
-
-    unique_configs = {}
-    for group_name, cfg_list in groups.items():
-        for spread_cfg in cfg_list:
-            p_i, f_i, p_e, f_e = spread_cfg
-            tag = config_tag(p_i, f_i, p_e, f_e)
-            unique_configs[tag] = (float(p_i), int(f_i), float(p_e), int(f_e))
-
-    for topo_seed in topologies:
-        for tag, (p_i, f_i, p_e, f_e) in unique_configs.items():
-            work.append((tag, p_i, f_i, p_e, f_e, topo_seed))
-
-    total = len(work)
-    print(f"╔══════════════════════════════════════════════════════════════╗")
-    print(f"║  Sweep runner")
-    print(f"║  Unique configs: {len(unique_configs)}")
-    print(f"║  Topologies:     {len(topologies)}")
-    print(f"║  Total runs:     {total}   (trials/run={trials}, nodes={num_nodes})")
-    print(f"║  Out dir:        {out_dir}")
-    print(f"╚══════════════════════════════════════════════════════════════╝")
-
-    n_skipped = 0
-    n_run = 0
-    n_extended = 0
-    n_failed = 0
-
+    counters = {"skipped": 0, "ran": 0, "extended": 0, "failed": 0}
     t_start = time.time()
-    for i, (tag, p_i, f_i, p_e, f_e, topo_seed) in enumerate(work, start=1):
-        cfg_dir = out_dir / "runs" / tag
-        cfg_dir.mkdir(parents=True, exist_ok=True)
-        export_path = cfg_dir / f"topo-{topo_seed}.json"
-        meta_path = cfg_dir / f"topo-{topo_seed}.meta.json"
 
-        existing_ok = False
-        start_trial = 0
-        if export_path.is_file():
-            try:
-                with open(export_path) as f:
-                    json.load(f)
-                existing_ok = True
-                start_trial = existing_trial_count(export_path)
-            except Exception:
-                print(f"[{i}/{total}] re-run {tag} topo={topo_seed} (corrupted)")
-
-        # Decide action based on existing state + --extend flag.
-        is_extend = False
-        if existing_ok and not args.extend:
-            n_skipped += 1
-            print(f"[{i}/{total}] SKIP {tag} topo={topo_seed}")
-            continue
-        if existing_ok and args.extend:
-            is_extend = True
-            print(f"[{i}/{total}] extend {tag} topo={topo_seed} "
-                  f"(start_trial={start_trial}, +{trials} trials)")
-        else:
-            print(f"[{i}/{total}] run  {tag} topo={topo_seed}")
-
-        # Build env — per-run overrides win over base_env.
-        spread_env = {
-            "SPREAD_SIMNET_SEED":       topo_seed,
-            "SPREAD_INTRA_RHO":         p_i,
-            "SPREAD_INTRA_FANOUT":      f_i,
-            "SPREAD_INTER_PROB":        p_e,
-            "SPREAD_INTER_FANOUT":      f_e,
-            "SPREAD_SIMNET_RUN_ID":     f"{tag}_topo-{topo_seed}",
-            "SPREAD_SIMNET_START_TRIAL": start_trial,
-        }
-        env = build_env(base_env, spread_env)
-
-        # Fresh runs write directly to export_path. Extensions write to a temp
-        # path and then merge into the existing export_path.
-        if is_extend:
-            target_path = cfg_dir / f"topo-{topo_seed}.extend.tmp.json"
-            if target_path.exists():
-                try: target_path.unlink()
-                except: pass
-        else:
-            target_path = export_path
-
-        log_path = cfg_dir / f"topo-{topo_seed}.log"
-
-        success = False
-        last_rc = None
-        last_elapsed = 0.0
-        for attempt in range(args.max_retries + 1):
-            success, elapsed, rc = run_one(
-                repo_dir, env, target_path,
-                cfg_dir / f"topo-{topo_seed}.attempt-{attempt}.log",
-                args.timeout_sec,
-                test_binary,
+    # ---- Gossipsub: one invocation per seed, fast, independent of spread ----
+    if gs_enabled:
+        gs_subdir = gossipsub_subdir(gs_cfg)
+        gs_dir    = out_dir / "gossipsub" / gs_subdir
+        gs_env    = gossipsub_env(gs_cfg)
+        print(f"╔══════════════════════════════════════════════════════════════╗")
+        print(f"║  Gossipsub baseline  ({gs_subdir})")
+        print(f"║  Topologies: {len(topologies)}   trials/run={trials}  nodes={num_nodes}")
+        print(f"║  Out: {gs_dir}")
+        print(f"╚══════════════════════════════════════════════════════════════╝")
+        for i, topo_seed in enumerate(topologies, start=1):
+            extra = {
+                **gs_env,
+                "SPREAD_SIMNET_SEED":        topo_seed,
+                "SPREAD_SIMNET_SKIP_SCENARIO": "spread",
+                "SPREAD_SIMNET_RUN_ID":      f"gs_{gs_subdir}_topo-{topo_seed}",
+            }
+            dispatch_one(
+                label=f"gs {i}/{len(topologies)} seed={topo_seed}",
+                repo_dir=repo_dir, target_dir=gs_dir, base_name=f"topo-{topo_seed}",
+                extra_env=extra, base_env=base_env, test_binary=test_binary,
+                trials=trials, extend=extend,
+                max_retries=args.max_retries, timeout_sec=args.timeout_sec,
+                results_log=results_log,
+                meta_extras={
+                    "kind":           "gossipsub",
+                    "topology_seed":  topo_seed,
+                    "nodes":          num_nodes,
+                    "gossipsub_d":    gs_cfg.get("D"),
+                    "gossipsub_d_low":  gs_cfg.get("D_low"),
+                    "gossipsub_d_high": gs_cfg.get("D_high"),
+                },
+                counters=counters,
             )
-            last_rc = rc
-            last_elapsed = elapsed
-            if success:
-                if rc != 0:
-                    print(f"   ℹ️  salvaged valid export despite rc={rc} "
-                          f"(likely teardown hang after successful write)")
-                break
-            print(f"   ⚠️  attempt {attempt+1} failed (rc={rc}, {elapsed:.0f}s)")
-            # If the output file got partially written, delete it
-            if target_path.is_file() and not success:
-                try: target_path.unlink()
-                except: pass
 
-        # On extend success: merge the extension JSON into the existing export.
-        if success and is_extend:
-            try:
-                merge_extension(export_path, target_path)
-                target_path.unlink()
-            except Exception as e:
-                print(f"   ⚠️  merge failed: {e}")
-                success = False
-
-        # Write meta + log result
-        meta = {
-            "tag":            tag,
-            "topology_seed":  topo_seed,
-            "groups":         sorted(config_to_groups.get(tag, set())),
-            "p_i":            p_i,
-            "f_i":            f_i,
-            "p_e":            p_e,
-            "f_e":            f_e,
-            "nodes":          num_nodes,
-            "trials":         trials,
-            "start_trial":    start_trial,
-            "extended":       is_extend,
-            "success":        success,
-            "duration_s":     last_elapsed,
-            "returncode":     last_rc,
-            "timestamp":      time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        }
-        with open(meta_path, "w") as f:
-            json.dump(meta, f, indent=2)
-        with open(results_log, "a") as f:
-            f.write(json.dumps(meta) + "\n")
-
-        if success:
-            if is_extend:
-                n_extended += 1
-            else:
-                n_run += 1
+    # ---- Spread: per (group config × seed) ----------------------------------
+    if sp_enabled:
+        groups = sp_cfg.get("groups") or {}
+        if not groups:
+            print("spread.enabled=true but spread.groups is empty — skipping spread phase.",
+                  file=sys.stderr)
         else:
-            n_failed += 1
+            # Resolve unique tags across all groups, plus which groups each tag belongs to.
+            config_to_groups = {}
+            unique_configs   = {}
+            for group_name, cfg_list in groups.items():
+                for scfg in cfg_list:
+                    p_i, f_i, p_e, f_e = scfg
+                    tag = config_tag(p_i, f_i, p_e, f_e)
+                    config_to_groups.setdefault(tag, set()).add(group_name)
+                    unique_configs[tag] = (float(p_i), int(f_i), float(p_e), int(f_e))
+
+            total = len(unique_configs) * len(topologies)
+            spread_root = out_dir / "spread" / "runs"
+            print(f"╔══════════════════════════════════════════════════════════════╗")
+            print(f"║  Spread sweep")
+            print(f"║  Unique configs: {len(unique_configs)}   topologies: {len(topologies)}")
+            print(f"║  Total runs:     {total}   trials/run={trials}  nodes={num_nodes}")
+            print(f"║  Out: {spread_root}")
+            print(f"╚══════════════════════════════════════════════════════════════╝")
+
+            warmup_every   = sp_cfg.get("warmup_every", 0)
+            warmup_rounds  = sp_cfg.get("warmup_rounds_per_publish", 1)
+            sp_extra_env   = sp_cfg.get("env") or {}
+            i = 0
+            for topo_seed in topologies:
+                for tag, (p_i, f_i, p_e, f_e) in unique_configs.items():
+                    i += 1
+                    target_dir = spread_root / tag
+                    extra = {
+                        **sp_extra_env,
+                        "SPREAD_SIMNET_SEED":          topo_seed,
+                        "SPREAD_SIMNET_SKIP_SCENARIO": "gossipsub",
+                        "SPREAD_INTRA_RHO":            p_i,
+                        "SPREAD_INTRA_FANOUT":         f_i,
+                        "SPREAD_INTER_PROB":           p_e,
+                        "SPREAD_INTER_FANOUT":         f_e,
+                        "SPREAD_SIMNET_RUN_ID":        f"sp_{tag}_topo-{topo_seed}",
+                        "SPREAD_SIMNET_WARMUP_EVERY":  warmup_every,
+                        "SPREAD_SIMNET_WARMUP_ROUNDS_PER_PUBLISH": warmup_rounds,
+                    }
+                    dispatch_one(
+                        label=f"sp {i}/{total} {tag} seed={topo_seed}",
+                        repo_dir=repo_dir, target_dir=target_dir,
+                        base_name=f"topo-{topo_seed}",
+                        extra_env=extra, base_env=base_env, test_binary=test_binary,
+                        trials=trials, extend=extend,
+                        max_retries=args.max_retries, timeout_sec=args.timeout_sec,
+                        results_log=results_log,
+                        meta_extras={
+                            "kind":           "spread",
+                            "tag":            tag,
+                            "topology_seed":  topo_seed,
+                            "groups":         sorted(config_to_groups.get(tag, set())),
+                            "p_i":            p_i,
+                            "f_i":            f_i,
+                            "p_e":            p_e,
+                            "f_e":            f_e,
+                            "nodes":          num_nodes,
+                        },
+                        counters=counters,
+                    )
 
     elapsed_total = time.time() - t_start
     print()
     print(f"✅ Done in {elapsed_total/60:.1f} min")
-    print(f"   skipped={n_skipped}  ran={n_run}  extended={n_extended}  failed={n_failed}")
+    print(f"   skipped={counters['skipped']}  "
+          f"ran={counters['ran']}  extended={counters['extended']}  "
+          f"failed={counters['failed']}")
     print()
     print(f"Charts:")
     print(f"   python3 simnet_spread_tests/sweep_plotter.py --data-dir '{out_dir}' --groups <plot_groups.yaml>")

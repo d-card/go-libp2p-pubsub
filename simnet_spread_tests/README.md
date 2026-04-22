@@ -177,13 +177,41 @@ python3 simnet_spread_tests/make_sweep_config.py \
 
 Subsamples the enumerated sets into 8 groups (3 × A subgroups, 3 × B subgroups, 1 × C, 1 × D) with ~5–6 configs each, and writes a ready-to-run YAML.
 
-Config sections:
+Config structure (new, post-refactor):
 
-| Section | Meaning |
-|---------|---------|
-| `topologies:` | list of seeds — each unique spread config is run once per seed |
-| `env:` | pass-through `SPREAD_*` env vars (including `SPREAD_SIMNET_NODES`, `SPREAD_SIMNET_TRIALS`) |
-| `groups:` | `group_name → list of [p_i, f_i, p_e, f_e]` — each group is one connected line on the plot |
+```yaml
+extend: false                  # extend mode — see below
+topologies: [1337, ...]
+
+simnet:                        # global simulation knobs (apply to both scenarios)
+  nodes: 30
+  trials: 30
+  link_mibps: 20
+  scenario_timeout_ms: 600000
+  enable_crash: false
+  crash_pct: 0.0
+  attacker_pcts: [0.1, 0.2, 0.3, 0.4, 0.5]
+
+gossipsub:                     # GossipSub baseline — one run per seed
+  enabled: true
+  D: 6
+  D_low: 5
+  D_high: 12
+
+spread:                        # SPREAD sweep — one run per (group config × seed)
+  enabled: true
+  warmup_every: 0
+  warmup_rounds_per_publish: 1
+  env:                         # pass-through SPREAD_* implementation knobs
+    SPREAD_CLUSTER_PCT: 0.25
+    ...
+  groups:
+    D_fanouts_vs_bernoullis:
+      - [p_i, f_i, p_e, f_e]
+      ...
+```
+
+Gossipsub output depends only on topology (not the spread knobs), so it's run once per seed under `gossipsub/<D-subdir>/`. Spread is run per (config, seed) under `spread/runs/<tag>/`. Setting either section's `enabled: false` skips that whole scenario family.
 
 ### 3. Run the sweep
 
@@ -193,57 +221,68 @@ python3 simnet_spread_tests/sweep_runner.py \
     --out-dir simnet_spread_tests/outputs/sweep_$(date +%Y%m%d_%H%M%S)
 ```
 
-Resumable: kill at any time and rerun with the same `--out-dir` — every `(config, topology)` whose `topo-<seed>.json` already exists is skipped.
+Resumable: kill at any time and rerun with the same `--out-dir` — every scenario run whose export already exists is skipped.
 
-#### Extending an existing sweep (`--extend`)
+#### Extending an existing sweep
 
-Already ran a sweep and want **more trials per config** without re-running what you have? Pass `--extend`:
-
-```bash
-python3 simnet_spread_tests/sweep_runner.py \
-    --config simnet_spread_tests/sweep_config.yaml \
-    --out-dir simnet_spread_tests/outputs/<existing_sweep> \
-    --extend
-```
+Flip `extend: true` at the top of `sweep_config.yaml` and re-run against the same `--out-dir`.
 
 Behavior:
-- For each `(config, topology)` whose `topo-<seed>.json` **already exists**, the runner reads its trial count, runs `SPREAD_SIMNET_TRIALS` more trials starting from that offset, and merges the new trials into the same JSON. Trial indices stay continuous (`0..29` + `30..89`).
-- For each `(config, topology)` whose `topo-<seed>.json` **does not exist**, the runner runs a fresh batch of `SPREAD_SIMNET_TRIALS` trials — same as a normal run.
+- For each existing export (gossipsub per-seed, spread per-config-seed), the runner reads its trial count, runs `simnet.trials` more trials starting from that offset, and merges the new trials into the same JSON. Trial indices stay continuous (`0..29` + `30..89`).
+- For each missing export, the runner runs a fresh batch of `simnet.trials` trials.
 - The start offset is computed automatically from the existing JSON. You never set `SPREAD_SIMNET_START_TRIAL` yourself.
 - Continuation is **deterministic**: trial N's source (`alive[N % len(alive)]`) and RNG seed (`seed + 7919 + N`) are pure functions of `(seed, N)`, so extending `30 → 90` is byte-identical to running `90` from scratch.
-- After each merge, the runner recomputes `gossipsub_attacker_accuracy` / `spread_attacker_accuracy` from the combined trial list.
+- After each merge, the runner recomputes the per-pct attacker accuracy summaries from the combined trial list.
 
-**Numerical example.** You ran with `SPREAD_SIMNET_TRIALS: 30` (30 nodes, 1 topology) and now want 60 more trials per config:
+**Numerical example.** You ran with `simnet.trials: 30` and now want 60 more trials:
 
-1. Bump `SPREAD_SIMNET_TRIALS` to `60` in `sweep_config.yaml`.
-2. Rerun with `--extend` and the **same** `--out-dir`.
-3. Each existing topo file goes from 30 → 90 trials. Any config you added to the YAML since the first run gets a fresh 60-trial batch.
+1. Bump `simnet.trials` to `60` and set `extend: true` in `sweep_config.yaml`.
+2. Rerun with the **same** `--out-dir`.
+3. Each existing export goes from 30 → 90 trials. Any config/seed you added gets a fresh 60-trial batch.
 
 #### Skipping a scenario
 
-Set `SPREAD_SIMNET_SKIP_SCENARIO` in the config's `env:` section (or the process env) to `gossipsub` or `spread` to run only one side. Halves the per-run cost when you only need more data on one protocol. Leave unset (or empty) to run both, the default.
-
-Caveat: if you skip one side and later extend the same out-dir with both sides enabled, the new gossipsub (or spread) data starts at the trial offset of the other side — which means trials `0..start-1` are missing for the previously-skipped side. Pick a scheme and stick with it per sweep.
+Set `gossipsub.enabled: false` or `spread.enabled: false` to skip that scenario entirely. (Setting both to false is rejected.) Gossipsub is topology-only, so running it once per seed — not per spread config — is the default and saves significant compute compared to running it alongside every spread config.
 
 #### Per-run speedups
 
 Two optimizations are built in and need no configuration:
 
 - The test binary is compiled **once** at the start of a sweep (`go test -c`) and the resulting binary is reused for every run, skipping Go's build pipeline per invocation.
-- The Ethereum-like latency matrix is cached in-process by `(nodes, seed)`, so within one invocation the gossipsub and spread scenarios share the same parsed `spread_data/` files and computed weights matrix instead of redoing the decode + matrix build twice.
+- The Ethereum-like latency matrix is cached in-process by `(nodes, seed)`, so repeated calls to `makeEthereumLikeTopology` with the same args skip the file decode + matrix build.
 
 Output layout:
 
 ```text
 outputs/<sweep_name>/
-  sweep_config.yaml                       # copy of the input
-  runs/
-    ir<p_i>_ip<p_e>_if<f_i>_ef<f_e>/     # one directory per unique config
-      topo-<seed>.json                    # raw export (same schema as batch runner)
-      topo-<seed>.meta.json               # timestamp, duration, groups
-      topo-<seed>.attempt-N.log           # stdout from each attempt
-  results.jsonl                           # append-only log of every completed run
+  sweep_config.yaml                         # copy of the input
+  .sweep_test_binary                        # prebuilt go test binary
+  prebuild.log
+  results.jsonl                             # append-only log of every completed run
+  gossipsub/
+    d<D>_dl<D_low>_dh<D_high>/              # one subdir per gossipsub D-param set
+      topo-<seed>.json                      # only gossipsub data
+      topo-<seed>.meta.json
+      topo-<seed>.attempt-N.log
+  spread/
+    runs/
+      ap<p_i>_af<f_i>_ep<p_e>_ef<f_e>/      # one dir per unique spread config
+        topo-<seed>.json                    # only spread data
+        topo-<seed>.meta.json
+        topo-<seed>.attempt-N.log
 ```
+
+#### Migrating old sweep outputs
+
+If you have a sweep directory from before the layout refactor, migrate it once with:
+
+```bash
+python3 simnet_spread_tests/one_time_migrate_layout.py \
+    --data-dir simnet_spread_tests/outputs/<sweep> \
+    --gossipsub-d 6,5,12
+```
+
+`--gossipsub-d` is required: old exports don't record the D params they were run with, so you declare them at migration time (determines the `d<D>_dl<D_low>_dh<D_high>/` subdir for the gossipsub split). Migration is idempotent — safe to rerun. After completion, the original `runs/` dir is moved to `runs.legacy-backup/` as a safety net.
 
 ### 4. Plot
 
@@ -253,7 +292,10 @@ python3 simnet_spread_tests/sweep_plotter.py \
     --groups simnet_spread_tests/plot_groups.yaml
 ```
 
-The plot groups YAML is independent from the run config — you can re-group the same data for different charts without re-running experiments. It needs a `groups:` section (each tuple must match exactly a `(p_i, f_i, p_e, f_e)` that was run) and optionally a `topologies:` list to restrict which seeds feed the plot. If `topologies:` is omitted or empty, every `topo-*.json` under each config dir is used — the default.
+The plot groups YAML is independent from the run config — you can re-group the same data for different charts without re-running experiments. It needs a `groups:` section (each tuple must match exactly a `(p_i, f_i, p_e, f_e)` that was run) and optionally:
+
+- `topologies:` — list of seeds to restrict the plot to. Omit/empty → use every `topo-*.json` found.
+- `gossipsub_d: {D: 6, D_low: 5, D_high: 12}` — pick which gossipsub D-param subdir to use for the baseline. Required only when multiple `gossipsub/d*_dl*_dh*/` exist; auto-picked if only one is present.
 
 Options:
 

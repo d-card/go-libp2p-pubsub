@@ -213,31 +213,57 @@ def aggregate(exports, attacker_pct=0.2):
     }
 
 
-def build_global_gs_baseline(data_dir, attacker_pct, topology_filter=None):
-    """Compute one gossipsub baseline by pooling every gs delivery across the
-    whole sweep, instead of averaging per-config means.
+def _discover_gossipsub_dir(data_dir, gossipsub_d=None):
+    """Return the Path to the gossipsub subdir to read from, or None.
 
-    Gossipsub output only depends on (nodes, seed, trials), not on the swept
-    spread config. Pooling raw deliveries naturally weights each (seed, trial)
-    the same regardless of how many config dirs happen to hold gs data for it,
-    which gives a statistically fair baseline when gs coverage is uneven.
+    If `gossipsub_d` is a dict like {"D": 8, "D_low": 6, "D_high": 12}, require
+    that exact subdir to exist. Otherwise, auto-pick the single d*_dl*_dh*
+    subdir present under <data_dir>/gossipsub/. Error if multiple exist and
+    no selector was given — user must disambiguate.
+    """
+    root = Path(data_dir) / "gossipsub"
+    if not root.is_dir():
+        return None
+    candidates = sorted(p for p in root.iterdir()
+                        if p.is_dir() and re.match(r"^d\d+_dl\d+_dh\d+$", p.name))
+    if not candidates:
+        return None
+    if gossipsub_d:
+        name = f"d{gossipsub_d['D']}_dl{gossipsub_d['D_low']}_dh{gossipsub_d['D_high']}"
+        for c in candidates:
+            if c.name == name:
+                return c
+        raise ValueError(f"gossipsub_d {gossipsub_d} -> subdir {name!r} not found "
+                         f"under {root} (have: {[c.name for c in candidates]})")
+    if len(candidates) > 1:
+        raise ValueError(
+            f"multiple gossipsub D-param subdirs found under {root} "
+            f"({[c.name for c in candidates]}); specify gossipsub_d in plot_groups.yaml"
+        )
+    return candidates[0]
+
+
+def build_global_gs_baseline(data_dir, attacker_pct, topology_filter=None,
+                             gossipsub_d=None):
+    """Pool every gossipsub delivery into one baseline across the sweep.
+
+    New layout: reads <data_dir>/gossipsub/<d-subdir>/topo-*.json directly —
+    one file per seed, already deduped by the runner's output structure.
+
+    Legacy layout fallback: if no new-layout gossipsub dir exists, scans the
+    old <data_dir>/runs/<tag>/topo-*.json files and dedups gs data per seed
+    (keeping the longest trial list seen).
 
     Returns a dict with keys matching the per-config aggregate shape
     (`gs_stretch_mean`, `gs_latency_p95`, `gs_accuracy`, …) or None if no
     gossipsub data exists anywhere in the sweep.
     """
-    runs_dir = Path(data_dir) / "runs"
-    if not runs_dir.is_dir():
-        return None
-
-    # Dedup gs data per (seed). Same seed can appear under many config dirs
-    # with identical gossipsub output (topology-only), so count it once and
-    # keep the longest trial list we've seen (captures extensions).
     gs_by_seed = {}
-    for cfg_dir in sorted(runs_dir.iterdir()):
-        if not cfg_dir.is_dir():
-            continue
-        for path in sorted(glob.glob(os.path.join(cfg_dir, "topo-*.json"))):
+    gs_dir = _discover_gossipsub_dir(data_dir, gossipsub_d=gossipsub_d)
+    if gs_dir is not None:
+        for path in sorted(glob.glob(os.path.join(gs_dir, "topo-*.json"))):
+            if ".meta." in path:
+                continue
             m = _TOPO_SEED_RE.search(path)
             if not m:
                 continue
@@ -252,9 +278,34 @@ def build_global_gs_baseline(data_dir, attacker_pct, topology_filter=None):
             gs = doc.get("gossipsub") or []
             if not gs:
                 continue
-            prev = gs_by_seed.get(seed)
-            if prev is None or len(gs) > len(prev["gs"]):
-                gs_by_seed[seed] = {"gs": gs, "acc": doc.get("gossipsub_attacker_accuracy") or []}
+            gs_by_seed[seed] = {"gs": gs, "acc": doc.get("gossipsub_attacker_accuracy") or []}
+    else:
+        # Legacy: scrape from old combined-scenario exports under runs/<tag>/
+        legacy_runs = Path(data_dir) / "runs"
+        if legacy_runs.is_dir():
+            for cfg_dir in sorted(legacy_runs.iterdir()):
+                if not cfg_dir.is_dir():
+                    continue
+                for path in sorted(glob.glob(os.path.join(cfg_dir, "topo-*.json"))):
+                    if ".meta." in path:
+                        continue
+                    m = _TOPO_SEED_RE.search(path)
+                    if not m:
+                        continue
+                    seed = int(m.group(1))
+                    if topology_filter and seed not in {int(s) for s in topology_filter}:
+                        continue
+                    try:
+                        with open(path) as f:
+                            doc = json.load(f)
+                    except Exception:
+                        continue
+                    gs = doc.get("gossipsub") or []
+                    if not gs:
+                        continue
+                    prev = gs_by_seed.get(seed)
+                    if prev is None or len(gs) > len(prev["gs"]):
+                        gs_by_seed[seed] = {"gs": gs, "acc": doc.get("gossipsub_attacker_accuracy") or []}
 
     if not gs_by_seed:
         return None
@@ -290,9 +341,22 @@ def build_global_gs_baseline(data_dir, attacker_pct, topology_filter=None):
     }
 
 
+def _spread_runs_dir(data_dir):
+    """Resolve the per-config spread output root.
+
+    New layout: <data_dir>/spread/runs/
+    Legacy layout: <data_dir>/runs/  (one JSON per (config, seed), with both
+    gossipsub and spread data interleaved)
+    """
+    new = Path(data_dir) / "spread" / "runs"
+    if new.is_dir():
+        return new
+    return Path(data_dir) / "runs"
+
+
 def build_config_index(data_dir, attacker_pct, topology_filter=None):
-    """Scan <data_dir>/runs/* and return {tag: metrics}."""
-    runs_dir = Path(data_dir) / "runs"
+    """Scan the per-config spread dirs and return {tag: metrics}."""
+    runs_dir = _spread_runs_dir(data_dir)
     index = {}
     if not runs_dir.is_dir():
         return index
@@ -471,21 +535,33 @@ def main():
     # means use every topo-*.json we find (current default behavior).
     topology_filter = plot_cfg.get("topologies") or None
 
+    # Optional: pick which gossipsub D-param subdir to use for the baseline.
+    # Required only when multiple gossipsub/d*_dl*_dh*/ exist under the sweep.
+    gossipsub_d = plot_cfg.get("gossipsub_d") or None
+    if gossipsub_d is not None:
+        missing = {"D", "D_low", "D_high"} - set(gossipsub_d)
+        if missing:
+            print(f"plot config error: gossipsub_d missing keys: {sorted(missing)}",
+                  file=sys.stderr)
+            sys.exit(2)
+
     print(f"Loading data from: {data_dir}")
     print(f"Attacker pct:      {args.attacker_pct}")
     if topology_filter:
         print(f"Topology filter:   {topology_filter}")
 
     # Rename any legacy-format config dirs in place before indexing, so old
-    # sweep outputs are picked up by the new-format scans downstream.
-    migrate_legacy_run_dirs(data_dir / "runs")
+    # sweep outputs are picked up by the new-format scans downstream. Run on
+    # whichever spread-runs dir is in use (new or legacy layout).
+    migrate_legacy_run_dirs(_spread_runs_dir(data_dir))
 
     index = build_config_index(data_dir, args.attacker_pct,
                                topology_filter=topology_filter)
     print(f"Loaded metrics for {len(index)} configs.")
 
     gs_baseline = build_global_gs_baseline(data_dir, args.attacker_pct,
-                                           topology_filter=topology_filter)
+                                           topology_filter=topology_filter,
+                                           gossipsub_d=gossipsub_d)
     if gs_baseline is not None:
         print(f"Pooled gossipsub baseline: {gs_baseline['n_seeds']} seeds, "
               f"{gs_baseline['n_deliveries']} deliveries")

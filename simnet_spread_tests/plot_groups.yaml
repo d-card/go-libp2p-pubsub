@@ -10,8 +10,14 @@
 #
 # Optional: `topologies:` restricts the plot to a subset of topology seeds.
 # Omit or leave empty to include every topo-*.json under each config dir.
+# Example topologies filter:
+#   topologies: [1337, 1338, 1339, 1340, 1341, 1342, 1343, 1344, 1345, 1346]
+#
+# Optional: `gossipsub_d:` picks which gossipsub D-param subdir under
+# <sweep>/gossipsub/ to use for the baseline. Required only when multiple
+# d*_dl*_dh*/ exist; auto-picked if only one is present.
 # Example:
-#   topologies: [1337, 1339]
+#   gossipsub_d: {D: 6, D_low: 5, D_high: 12}
 
 groups:
   A_Ce1.5:
