@@ -595,8 +595,8 @@ def main():
     p.add_argument("--data-dir", required=True, help="Sweep output directory")
     p.add_argument("--groups",   required=True, help="YAML file with plot groups")
     p.add_argument("--out-dir",  default=None, help="Chart output dir (default: <data-dir>/plots)")
-    p.add_argument("--attacker-pct", type=float, default=0.2,
-                   help="Attacker fraction for the deanon metric (default: 0.2)")
+    p.add_argument("--attacker-pct", type=float, default=0.1,
+                   help="Attacker fraction for the deanon metric (default: 0.1)")
     p.add_argument("--sort-key", default="p_i",
                    choices=["p_i", "f_i", "p_e", "f_e", "x", "anon"],
                    help="Within a group, connect points sorted by this (default: p_i). "
