@@ -400,6 +400,89 @@ def write_metrics_csv(index, out_path):
     print(f"  Saved: {out_path}")
 
 
+def chart_C_colored(index, groups, out_path, color_by="C",
+                    metric="stretch", stat="mean",
+                    gs_baseline=None):
+    """Scatter: X = Spread metric, Y = deanon accuracy, color = continuous C or Ci/C.
+
+    Only configs that appear in `groups` are plotted (same set as chart_anon_vs_metric).
+    color_by: "C"       — total expected messages: Ci + Ce = 1 + p_i*(f_i-1) + p_e*f_e
+              "Ci_frac" — intra fraction: Ci / C
+    """
+    x_key    = f"sp_{metric}_{stat}"
+    gs_x_key = f"gs_{metric}_{stat}"
+    anon_key = "sp_accuracy"
+
+    fig, ax = plt.subplots(figsize=(11, 8))
+
+    xs, ys, cs, labels = [], [], [], []
+    seen = set()
+    for cfg_list in groups.values():
+        for cfg in cfg_list:
+            p_i, f_i, p_e, f_e = cfg
+            tag = config_tag(p_i, f_i, p_e, f_e)
+            if tag in seen:
+                continue
+            seen.add(tag)
+            m = index.get(tag)
+            if m is None or m.get(x_key) is None or m.get(anon_key) is None:
+                continue
+            ci = 1.0 + p_i * (f_i - 1)
+            ce = p_e * f_e
+            C  = ci + ce
+            c_val = C if color_by == "C" else (ci / C if C > 0 else 0.0)
+            xs.append(m[x_key])
+            ys.append(m[anon_key])
+            cs.append(c_val)
+            labels.append((p_i, f_i, p_e, f_e))
+
+    if not xs:
+        print(f"  warn: no data to plot for {out_path}")
+        return
+
+    # GossipSub baseline star
+    baseline_x = baseline_y = None
+    if gs_baseline is not None:
+        baseline_x = gs_baseline.get(gs_x_key)
+        baseline_y = gs_baseline.get("gs_accuracy")
+    if baseline_x is not None and baseline_y is not None:
+        ax.scatter(baseline_x, baseline_y,
+                   color="black", marker="*", s=260, zorder=10,
+                   label="GossipSub baseline", edgecolors="white", linewidths=1.2)
+
+    cmap = "viridis" if color_by == "C" else "plasma"
+    sc = ax.scatter(xs, ys, c=cs, cmap=cmap, s=90,
+                    edgecolors="white", linewidths=0.8, zorder=5,
+                    vmin=min(cs), vmax=max(cs))
+    cbar = fig.colorbar(sc, ax=ax, pad=0.02)
+    if color_by == "C":
+        cbar.set_label(r"$C = C_i + C_e$  (total expected messages)", fontsize=10)
+        title_color = r"total expectation $C$"
+    else:
+        cbar.set_label(r"$C_i / C$  (intra fraction)", fontsize=10)
+        title_color = r"intra fraction $C_i / C$"
+
+    for (p_i, f_i, p_e, f_e), x, y in zip(labels, xs, ys):
+        ax.annotate(f"({p_i},{f_i},{p_e},{f_e})",
+                    xy=(x, y), xytext=(4, 4), textcoords="offset points",
+                    fontsize=5.5, alpha=0.7)
+
+    x_unit = " (ms)" if metric == "latency" else ""
+    ax.set_xlabel(f"Spread {metric} ({stat}){x_unit}  →  worse", fontsize=11)
+    ax.set_ylabel("Spread deanon accuracy  →  worse", fontsize=11)
+    ax.set_title(
+        f"Anonymity vs {metric.capitalize()} ({stat}) — colored by {title_color}.\n"
+        "Lower-left = better trade-off. Darker = lower value.",
+        fontsize=11)
+    if baseline_x is not None and baseline_y is not None:
+        ax.legend(fontsize=8, loc="best")
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {out_path}")
+
+
 def chart_anon_vs_metric(index, groups, out_path,
                          metric="stretch", stat="mean",
                          sort_key="p_i",
@@ -590,6 +673,17 @@ def main():
             sort_key=args.sort_key,
             gs_baseline=gs_baseline,
         )
+
+    # Color-coded plots: all configs as points, colored by C or Ci/C.
+    for metric, stat in chart_variants:
+        for color_by, suffix in [("C", "C"), ("Ci_frac", "Ci_frac")]:
+            chart_C_colored(
+                index, groups,
+                out_dir / f"scatter_anon_vs_{metric}_{stat}_color_{suffix}.png",
+                color_by=color_by,
+                metric=metric, stat=stat,
+                gs_baseline=gs_baseline,
+            )
 
     print("\nDone.")
 
