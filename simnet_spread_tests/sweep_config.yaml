@@ -1,0 +1,101 @@
+extend: false
+topologies: [1337, 1338, 1339]
+simnet:
+  nodes: 30
+  trials: 30
+  link_mibps: 20
+  scenario_timeout_ms: 600000
+  enable_crash: false
+  crash_pct: 0.0
+  attacker_pcts: [0.1, 0.2, 0.3, 0.4, 0.5]
+gossipsub:
+  enabled: true
+  D: 6
+  D_low: 5
+  D_high: 12
+spread:
+  enabled: true
+  warmup_every: 0
+  warmup_rounds_per_publish: 1
+  env:
+    SPREAD_CLUSTER_PCT: 0.25
+    SPREAD_NUM_RINGS: 4
+    SPREAD_FALLBACK_THRESHOLD: 3
+    SPREAD_DUPLICATE_REPROPAGATION: 5
+    SPREAD_USE_ANGULAR_INTER_PEERS: true
+    SPREAD_CC: 0.25
+    SPREAD_CE: 0.25
+    SPREAD_NEWTON: false
+    SPREAD_OUTLIER_THRESHOLD: 0
+    SPREAD_SAMPLES: 1
+    SPREAD_INTERVAL_MS: 150
+    SPREAD_NEIGHBOR_SET_SIZE: 24
+    SPREAD_IN1_THRESHOLD_MS: 20
+    SPREAD_IN2_THRESHOLD_MS: 35
+    SPREAD_IN3_MADK_RANDOM: 5
+    SPREAD_IN3_MADK_CLOSE: 8
+    SPREAD_IN3_MIN_SAMPLES: 4
+  groups:
+    A_Ce1.5:
+    - [0.875, 5, 0.3, 5]
+    - [0.7, 6, 0.3, 5]
+    - [0.5833, 7, 0.3, 5]
+    - [0.5, 8, 0.3, 5]
+    - [0.4375, 9, 0.3, 5]
+    - [0.3889, 10, 0.3, 5]
+    A_Ce3.0:
+    - [1.0, 3, 0.3, 10]
+    - [0.6667, 4, 0.3, 10]
+    - [0.5, 5, 0.3, 10]
+    - [0.4, 6, 0.3, 10]
+    - [0.3333, 7, 0.3, 10]
+    - [0.2857, 8, 0.3, 10]
+    A_Ce4.5:
+    - [0.5, 2, 0.3, 15]
+    - [0.25, 3, 0.3, 15]
+    - [0.1667, 4, 0.3, 15]
+    - [0.125, 5, 0.3, 15]
+    - [0.1, 6, 0.3, 15]
+    - [0.0833, 7, 0.3, 15]
+    B_Ci1.5:
+    - [0.25, 3, 0.9, 5]
+    - [0.25, 3, 0.75, 6]
+    - [0.25, 3, 0.6429, 7]
+    - [0.25, 3, 0.5625, 8]
+    - [0.25, 3, 0.5, 9]
+    - [0.25, 3, 0.45, 10]
+    B_Ci2.0:
+    - [0.5, 3, 1.0, 4]
+    - [0.5, 3, 0.8, 5]
+    - [0.5, 3, 0.6667, 6]
+    - [0.5, 3, 0.5714, 7]
+    - [0.5, 3, 0.5, 8]
+    - [0.5, 3, 0.4444, 9]
+    B_Ci2.5:
+    - [0.5, 4, 0.875, 4]
+    - [0.5, 4, 0.7, 5]
+    - [0.5, 4, 0.5833, 6]
+    - [0.5, 4, 0.5, 7]
+    - [0.5, 4, 0.4375, 8]
+    - [0.5, 4, 0.3889, 9]
+    C_f3_f6:
+    - [0.025, 3, 0.825, 6]
+    - [0.25, 3, 0.75, 6]
+    - [0.4, 3, 0.7, 6]
+    - [0.625, 3, 0.625, 6]
+    - [0.775, 3, 0.575, 6]
+    - [1.0, 3, 0.5, 6]
+    D_fanouts_vs_bernoullis:
+    - [1.0, 3, 1.0, 3]
+    - [0.8, 4, 0.65, 4]
+    - [0.7, 5, 0.44, 5]
+    - [0.64, 6, 0.3, 6]
+    - [0.6, 7, 0.2, 7]
+    - [0.5714, 8, 0.125, 8]
+    B_Ci3.5:
+    - [0.5, 5, 0.625, 4]
+    - [0.5, 5, 0.5, 5]
+    - [0.5, 5, 0.4167, 6]
+    - [0.5, 5, 0.3571, 7]
+    - [0.5, 5, 0.3125, 8]
+    - [0.5, 5, 0.2778, 9]

@@ -3,3 +3,14 @@ prof.out
 go-floodsub.test
 
 .idea/
+.vscode/
+.gopath/
+.gocache/
+.DS_Store
+*.pdf
+todos.md
+*.tex*
+
+.fontcache
+.mplcache
+cpu.out

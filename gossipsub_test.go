@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	crand "crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -3048,6 +3049,7 @@ func TestGossipsubIdontwantReceive(t *testing.T) {
 
 type mockRawTracer struct {
 	onRecvRPC func(*RPC)
+	onSendRPC func(*RPC, peer.ID)
 }
 
 func (m *mockRawTracer) RecvRPC(rpc *RPC) {
@@ -3066,12 +3068,143 @@ func (m *mockRawTracer) Leave(topic string)                        {}
 func (m *mockRawTracer) Prune(p peer.ID, topic string)             {}
 func (m *mockRawTracer) RejectMessage(msg *Message, reason string) {}
 func (m *mockRawTracer) RemovePeer(p peer.ID)                      {}
-func (m *mockRawTracer) SendRPC(rpc *RPC, p peer.ID)               {}
-func (m *mockRawTracer) ThrottlePeer(p peer.ID)                    {}
-func (m *mockRawTracer) UndeliverableMessage(msg *Message)         {}
-func (m *mockRawTracer) ValidateMessage(msg *Message)              {}
+func (m *mockRawTracer) SendRPC(rpc *RPC, p peer.ID) {
+	if m.onSendRPC != nil {
+		m.onSendRPC(rpc, p)
+	}
+}
+func (m *mockRawTracer) ThrottlePeer(p peer.ID)            {}
+func (m *mockRawTracer) UndeliverableMessage(msg *Message) {}
+func (m *mockRawTracer) ValidateMessage(msg *Message)      {}
 
 var _ RawTracer = &mockRawTracer{}
+
+func withSpreadExtensionAdvertiseForTests() Option {
+	return func(ps *PubSub) error {
+		gs, ok := ps.rt.(*GossipSubRouter)
+		if !ok {
+			return fmt.Errorf("pubsub router is not gossipsub")
+		}
+		gs.extensions.myExtensions.Spread = true
+		return nil
+	}
+}
+
+func publishWithSpreadForTests(ctx context.Context, topic *Topic, data []byte) error {
+	msg, err := topic.validate(ctx, data)
+	if err != nil {
+		return err
+	}
+	msg.Spread = true
+	return topic.p.val.sendMsgBlocking(msg)
+}
+
+func TestGossipsubSpreadDuplicateRepropagationBudget(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	hosts := getDefaultHosts(t, 6)
+	sourceIdx := []int{0, 1, 2, 3}
+	middleIdx := 4
+	sinkIdx := 5
+
+	topicName := "spread-duplicate-repropagation"
+	payload := []byte("same-payload")
+	hashMsgID := func(pmsg *pb.Message) string {
+		sum := sha256.Sum256(pmsg.GetData())
+		return string(sum[:])
+	}
+
+	var sendsFromMiddleToLast atomic.Int32
+	middleTracer := &mockRawTracer{
+		onSendRPC: func(rpc *RPC, p peer.ID) {
+			if p != hosts[sinkIdx].ID() || len(rpc.GetPublish()) == 0 {
+				return
+			}
+			for _, msg := range rpc.GetPublish() {
+				if msg.GetTopic() == topicName && bytes.Equal(msg.GetData(), payload) {
+					sendsFromMiddleToLast.Add(1)
+				}
+			}
+		},
+	}
+
+	commonOpts := []Option{
+		WithMessageIdFn(hashMsgID),
+		WithProtocolChoice(SPREAD),
+		WithSpreadPropagationConfig(&SpreadConfig{
+			IntraFanout:            1,
+			InterFanout:            0,
+			IntraRho:               1,
+			InterProb:              0,
+			FallbackThreshold:      1,
+			DuplicateRepropagation: 2,
+		}),
+		withSpreadExtensionAdvertiseForTests(),
+	}
+
+	psubs := make([]*PubSub, len(hosts))
+	for i := range hosts {
+		opts := append([]Option{}, commonOpts...)
+		if i == middleIdx {
+			opts = append(opts, WithRawTracer(middleTracer))
+		}
+		psubs[i] = getGossipsub(ctx, hosts[i], opts...)
+	}
+
+	for _, idx := range sourceIdx {
+		connect(t, hosts[idx], hosts[middleIdx])
+	}
+	connect(t, hosts[middleIdx], hosts[sinkIdx])
+
+	topics := make([]*Topic, 0, len(psubs))
+	for _, ps := range psubs {
+		topic, err := ps.Join(topicName)
+		if err != nil {
+			t.Fatal(err)
+		}
+		topics = append(topics, topic)
+	}
+
+	for i, topic := range topics {
+		if i == 0 || i == 1 || i == 2 || i == 3 {
+			continue
+		}
+		sub, err := topic.Subscribe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		go func(sub *Subscription) {
+			for {
+				_, err := sub.Next(ctx)
+				if err != nil {
+					return
+				}
+			}
+		}(sub)
+	}
+
+	time.Sleep(2 * time.Second)
+
+	for _, idx := range sourceIdx {
+		if err := publishWithSpreadForTests(ctx, topics[idx], payload); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if sendsFromMiddleToLast.Load() >= 3 {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	if got := sendsFromMiddleToLast.Load(); got != 3 {
+		t.Fatalf("expected middle peer to relay 3 times (1 initial + 2 duplicate repropagations), got %d", got)
+	}
+}
 
 func TestGossipsubNoIDONTWANTToMessageSender(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
