@@ -134,10 +134,10 @@ def aggregate(exports, attacker_pct=0.2):
     mean / median / p90 / p95 / p99. Accuracy buckets are averaged over
     topologies at the requested attacker_pct.
     """
-    gs_s, sp_s = [], []   # stretch values
-    gs_l, sp_l = [], []   # latency values (ms)
-    gs_a, sp_a = [], []   # accuracy at the requested attacker_pct
-    gs_curve, sp_curve = defaultdict(list), defaultdict(list)
+    gs_s, sp_s, dn_s = [], [], []   # stretch values
+    gs_l, sp_l, dn_l = [], [], []   # latency values (ms)
+    gs_a, sp_a, dn_a = [], [], []   # accuracy at the requested attacker_pct
+    gs_curve, sp_curve, dn_curve = defaultdict(list), defaultdict(list), defaultdict(list)
 
     for exp in exports:
         # `.get(..., [])` only defaults on missing keys; a present-but-null value
@@ -151,6 +151,10 @@ def aggregate(exports, attacker_pct=0.2):
             for d in t.get("deliveries", []):
                 sp_s.append(d["stretch"])
                 sp_l.append(d["latency_ms"])
+        for t in (exp.get("dandelion") or []):
+            for d in t.get("deliveries", []):
+                dn_s.append(d["stretch"])
+                dn_l.append(d["latency_ms"])
 
         for e in (exp.get("gossipsub_attacker_accuracy") or []):
             p = e["attacker_pct"]
@@ -162,11 +166,13 @@ def aggregate(exports, attacker_pct=0.2):
             sp_curve[p].append(e["accuracy"])
             if abs(p - attacker_pct) < 0.01:
                 sp_a.append(e["accuracy"])
+        for e in (exp.get("dandelion_attacker_accuracy") or []):
+            p = e["attacker_pct"]
+            dn_curve[p].append(e["accuracy"])
+            if abs(p - attacker_pct) < 0.01:
+                dn_a.append(e["accuracy"])
 
-    # Keep a config as long as it has any data on either side. A config with
-    # only spread (no gossipsub baseline) still plots correctly; the missing
-    # side just doesn't contribute to the baseline marker.
-    if not gs_s and not sp_s:
+    if not gs_s and not sp_s and not dn_s:
         return None
 
     def _stats(values, percentiles):
@@ -179,37 +185,50 @@ def aggregate(exports, attacker_pct=0.2):
 
     gs_stretch = _stats(gs_s, [90, 95, 99])
     sp_stretch = _stats(sp_s, [90, 95, 99])
+    dn_stretch = _stats(dn_s, [90, 95, 99])
     gs_latency = _stats(gs_l, [95])
     sp_latency = _stats(sp_l, [95])
+    dn_latency = _stats(dn_l, [95])
 
     return {
         "n_topologies":       len(exports),
         "n_deliveries_gs":    len(gs_s),
         "n_deliveries_sp":    len(sp_s),
+        "n_deliveries_dn":    len(dn_s),
 
         "gs_stretch_mean":    gs_stretch["mean"],
         "sp_stretch_mean":    sp_stretch["mean"],
+        "dn_stretch_mean":    dn_stretch["mean"],
         "gs_stretch_median":  gs_stretch["median"],
         "sp_stretch_median":  sp_stretch["median"],
+        "dn_stretch_median":  dn_stretch["median"],
         "gs_stretch_p90":     gs_stretch["p90"],
         "sp_stretch_p90":     sp_stretch["p90"],
+        "dn_stretch_p90":     dn_stretch["p90"],
         "gs_stretch_p95":     gs_stretch["p95"],
         "sp_stretch_p95":     sp_stretch["p95"],
+        "dn_stretch_p95":     dn_stretch["p95"],
         "gs_stretch_p99":     gs_stretch["p99"],
         "sp_stretch_p99":     sp_stretch["p99"],
+        "dn_stretch_p99":     dn_stretch["p99"],
 
         "gs_latency_mean":    gs_latency["mean"],
         "sp_latency_mean":    sp_latency["mean"],
+        "dn_latency_mean":    dn_latency["mean"],
         "gs_latency_median":  gs_latency["median"],
         "sp_latency_median":  sp_latency["median"],
+        "dn_latency_median":  dn_latency["median"],
         "gs_latency_p95":     gs_latency["p95"],
         "sp_latency_p95":     sp_latency["p95"],
+        "dn_latency_p95":     dn_latency["p95"],
 
         "gs_accuracy":        float(np.mean(gs_a)) if gs_a else None,
         "sp_accuracy":        float(np.mean(sp_a)) if sp_a else None,
+        "dn_accuracy":        float(np.mean(dn_a)) if dn_a else None,
 
         "gs_accuracy_curve":  {float(k): float(np.mean(v)) for k, v in gs_curve.items()},
         "sp_accuracy_curve":  {float(k): float(np.mean(v)) for k, v in sp_curve.items()},
+        "dn_accuracy_curve":  {float(k): float(np.mean(v)) for k, v in dn_curve.items()},
     }
 
 
@@ -341,6 +360,67 @@ def build_global_gs_baseline(data_dir, attacker_pct, topology_filter=None,
     }
 
 
+def build_global_dn_baseline(data_dir, attacker_pct, topology_filter=None):
+    """Pool every dandelion delivery into one baseline across the sweep.
+
+    Reads <data_dir>/dandelion/<subdir>/topo-*.json — one file per seed.
+    Returns a dict with dn_stretch_*, dn_latency_*, dn_accuracy keys, or None.
+    """
+    dn_root = Path(data_dir) / "dandelion"
+    if not dn_root.is_dir():
+        return None
+    subdirs = [p for p in dn_root.iterdir() if p.is_dir()]
+    if not subdirs:
+        return None
+    dn_dir = subdirs[0]  # use first (only one expected per sweep)
+
+    stretch, latency, acc_vals = [], [], []
+    acc_curve = defaultdict(list)
+    for path in sorted(glob.glob(os.path.join(dn_dir, "topo-*.json"))):
+        if ".meta." in path:
+            continue
+        m = _TOPO_SEED_RE.search(path)
+        if not m:
+            continue
+        seed = int(m.group(1))
+        if topology_filter and seed not in {int(s) for s in topology_filter}:
+            continue
+        try:
+            with open(path) as f:
+                doc = json.load(f)
+        except Exception:
+            continue
+        for t in (doc.get("dandelion") or []):
+            for d in t.get("deliveries", []):
+                stretch.append(d["stretch"])
+                latency.append(d["latency_ms"])
+        for e in (doc.get("dandelion_attacker_accuracy") or []):
+            p = e["attacker_pct"]
+            acc_curve[p].append(e["accuracy"])
+            if abs(p - attacker_pct) < 0.01:
+                acc_vals.append(e["accuracy"])
+
+    if not stretch:
+        return None
+
+    def _pct(values, p):
+        return float(np.percentile(values, p)) if values else None
+
+    return {
+        "n_seeds":            len(subdirs),
+        "n_deliveries":       len(stretch),
+        "dn_stretch_mean":    float(np.mean(stretch))   if stretch else None,
+        "dn_stretch_median":  float(np.median(stretch)) if stretch else None,
+        "dn_stretch_p90":     _pct(stretch, 90),
+        "dn_stretch_p95":     _pct(stretch, 95),
+        "dn_stretch_p99":     _pct(stretch, 99),
+        "dn_latency_mean":    float(np.mean(latency))   if latency else None,
+        "dn_latency_median":  float(np.median(latency)) if latency else None,
+        "dn_latency_p95":     _pct(latency, 95),
+        "dn_accuracy":        float(np.mean(acc_vals))  if acc_vals else None,
+    }
+
+
 def _spread_runs_dir(data_dir):
     """Resolve the per-config spread output root.
 
@@ -382,16 +462,16 @@ def build_config_index(data_dir, attacker_pct, topology_filter=None):
 
 def write_metrics_csv(index, out_path):
     cols = ["tag", "p_i", "f_i", "p_e", "f_e",
-            "n_topologies", "n_deliveries_gs", "n_deliveries_sp",
-            "gs_stretch_mean", "sp_stretch_mean",
-            "gs_stretch_median", "sp_stretch_median",
-            "gs_stretch_p90", "sp_stretch_p90",
-            "gs_stretch_p95", "sp_stretch_p95",
-            "gs_stretch_p99", "sp_stretch_p99",
-            "gs_latency_mean", "sp_latency_mean",
-            "gs_latency_median", "sp_latency_median",
-            "gs_latency_p95", "sp_latency_p95",
-            "gs_accuracy", "sp_accuracy"]
+            "n_topologies", "n_deliveries_gs", "n_deliveries_sp", "n_deliveries_dn",
+            "gs_stretch_mean", "sp_stretch_mean", "dn_stretch_mean",
+            "gs_stretch_median", "sp_stretch_median", "dn_stretch_median",
+            "gs_stretch_p90", "sp_stretch_p90", "dn_stretch_p90",
+            "gs_stretch_p95", "sp_stretch_p95", "dn_stretch_p95",
+            "gs_stretch_p99", "sp_stretch_p99", "dn_stretch_p99",
+            "gs_latency_mean", "sp_latency_mean", "dn_latency_mean",
+            "gs_latency_median", "sp_latency_median", "dn_latency_median",
+            "gs_latency_p95", "sp_latency_p95", "dn_latency_p95",
+            "gs_accuracy", "sp_accuracy", "dn_accuracy"]
     with open(out_path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(cols)
@@ -402,7 +482,7 @@ def write_metrics_csv(index, out_path):
 
 def chart_C_colored(index, groups, out_path, color_by="C",
                     metric="stretch", stat="mean",
-                    gs_baseline=None):
+                    gs_baseline=None, dn_baseline=None):
     """Scatter: X = Spread metric, Y = deanon accuracy, color = continuous C or Ci/C.
 
     Only configs that appear in `groups` are plotted (same set as chart_anon_vs_metric).
@@ -450,6 +530,15 @@ def chart_C_colored(index, groups, out_path, color_by="C",
                    color="black", marker="*", s=260, zorder=10,
                    label="GossipSub baseline", edgecolors="white", linewidths=1.2)
 
+    dn_x_key = f"dn_{metric}_{stat}"
+    if dn_baseline is not None:
+        dn_bx = dn_baseline.get(dn_x_key)
+        dn_by = dn_baseline.get("dn_accuracy")
+        if dn_bx is not None and dn_by is not None:
+            ax.scatter(dn_bx, dn_by,
+                       color="darkorange", marker="D", s=180, zorder=10,
+                       label="Dandelion baseline", edgecolors="white", linewidths=1.2)
+
     cmap = "viridis" if color_by == "C" else "plasma"
     sc = ax.scatter(xs, ys, c=cs, cmap=cmap, s=90,
                     edgecolors="white", linewidths=0.8, zorder=5,
@@ -486,7 +575,7 @@ def chart_C_colored(index, groups, out_path, color_by="C",
 def chart_anon_vs_metric(index, groups, out_path,
                          metric="stretch", stat="mean",
                          sort_key="p_i",
-                         gs_baseline=None):
+                         gs_baseline=None, dn_baseline=None):
     """
     Scatter: X = Spread `<metric>_<stat>`, Y = Spread deanon accuracy.
     One connected line per group. Points sorted by `sort_key` within a group.
@@ -522,6 +611,15 @@ def chart_anon_vs_metric(index, groups, out_path,
         ax.scatter(baseline_x, baseline_y,
                    color="black", marker="*", s=260, zorder=10,
                    label="GossipSub baseline", edgecolors="white", linewidths=1.2)
+
+    dn_x_key = f"dn_{metric}_{stat}"
+    if dn_baseline is not None:
+        dn_bx = dn_baseline.get(dn_x_key)
+        dn_by = dn_baseline.get("dn_accuracy")
+        if dn_bx is not None and dn_by is not None:
+            ax.scatter(dn_bx, dn_by,
+                       color="darkorange", marker="D", s=180, zorder=10,
+                       label="Dandelion baseline", edgecolors="white", linewidths=1.2)
 
     any_plotted = False
     for i, (group_name, cfg_list) in enumerate(sorted(groups.items())):
@@ -650,6 +748,14 @@ def main():
               f"{gs_baseline['n_deliveries']} deliveries")
     else:
         print("No gossipsub data found — baseline marker will be omitted.")
+
+    dn_baseline = build_global_dn_baseline(data_dir, args.attacker_pct,
+                                           topology_filter=topology_filter)
+    if dn_baseline is not None:
+        print(f"Pooled dandelion baseline: {dn_baseline['n_seeds']} seeds, "
+              f"{dn_baseline['n_deliveries']} deliveries")
+    else:
+        print("No dandelion data found — dandelion marker will be omitted.")
     print()
 
     print(f"Writing outputs to {out_dir}/")
@@ -672,6 +778,7 @@ def main():
             metric=metric, stat=stat,
             sort_key=args.sort_key,
             gs_baseline=gs_baseline,
+            dn_baseline=dn_baseline,
         )
 
     # Color-coded plots: all configs as points, colored by C or Ci/C.
@@ -683,6 +790,7 @@ def main():
                 color_by=color_by,
                 metric=metric, stat=stat,
                 gs_baseline=gs_baseline,
+                dn_baseline=dn_baseline,
             )
 
     print("\nDone.")
