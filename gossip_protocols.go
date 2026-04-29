@@ -2,9 +2,8 @@ package pubsub
 
 const (
 	GOSSIPSUB = 1
-	HIERARCHICAL_GOSSIP = 2
-	SPATIAL_GOSSIP = 3
-	DANDELION_GOSSIP = 4
+	SPREAD    = 2
+	DANDELION = 3
 )
 
 type GossipProtocolChoice int
