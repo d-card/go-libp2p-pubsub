@@ -114,14 +114,15 @@ def build_env(base_env, extra):
 
 # ---- Structured config → env mapping --------------------------------------
 
-_ALLOWED_TOP_KEYS      = {"extend", "topologies", "simnet", "gossipsub", "spread"}
-_ALLOWED_SIMNET_KEYS   = {
+_ALLOWED_TOP_KEYS       = {"extend", "topologies", "simnet", "gossipsub", "spread", "dandelion"}
+_ALLOWED_SIMNET_KEYS    = {
     "nodes", "trials", "link_mibps", "scenario_timeout_ms",
     "enable_crash", "crash_pct", "attacker_pcts",
 }
-_ALLOWED_GOSSIPSUB_KEYS = {"enabled", "D", "D_low", "D_high"}
-_ALLOWED_SPREAD_KEYS    = {"enabled", "warmup_every", "warmup_rounds_per_publish",
-                            "groups", "env"}
+_ALLOWED_GOSSIPSUB_KEYS  = {"enabled", "D", "D_low", "D_high"}
+_ALLOWED_SPREAD_KEYS     = {"enabled", "warmup_every", "warmup_rounds_per_publish",
+                             "groups", "env"}
+_ALLOWED_DANDELION_KEYS  = {"enabled", "fanout", "prob"}
 
 
 def validate_config(cfg):
@@ -143,8 +144,9 @@ def validate_config(cfg):
             raise ValueError(f"`simnet.{required}` is required")
     gs = cfg.get("gossipsub") or {}
     sp = cfg.get("spread") or {}
-    if not gs.get("enabled") and not sp.get("enabled"):
-        raise ValueError("at least one of gossipsub.enabled / spread.enabled must be true")
+    dn = cfg.get("dandelion") or {}
+    if not gs.get("enabled") and not sp.get("enabled") and not dn.get("enabled"):
+        raise ValueError("at least one of gossipsub.enabled / spread.enabled / dandelion.enabled must be true")
     if gs:
         unknown = set(gs) - _ALLOWED_GOSSIPSUB_KEYS
         if unknown:
@@ -153,6 +155,10 @@ def validate_config(cfg):
         unknown = set(sp) - _ALLOWED_SPREAD_KEYS
         if unknown:
             raise ValueError(f"unknown spread keys: {sorted(unknown)}")
+    if dn:
+        unknown = set(dn) - _ALLOWED_DANDELION_KEYS
+        if unknown:
+            raise ValueError(f"unknown dandelion keys: {sorted(unknown)}")
 
 
 def simnet_env(simnet_cfg):
@@ -195,6 +201,23 @@ def gossipsub_env(gs_cfg):
     return e
 
 
+def dandelion_subdir(dn_cfg):
+    """Return `fanout<F>_prob<P>`, using Go-side defaults (6/0.8) when absent."""
+    fanout = dn_cfg.get("fanout", 6)
+    prob   = dn_cfg.get("prob", 0.8)
+    return f"fanout{fanout}_prob{prob}"
+
+
+def dandelion_env(dn_cfg):
+    """Env vars for Dandelion params. Only emitted when explicitly set."""
+    e = {}
+    if "fanout" in dn_cfg:
+        e["DANDELION_FANOUT"] = dn_cfg["fanout"]
+    if "prob" in dn_cfg:
+        e["DANDELION_PROB"] = dn_cfg["prob"]
+    return e
+
+
 def existing_trial_count(export_path):
     """Return the number of trials already recorded in an existing topo JSON.
 
@@ -206,12 +229,19 @@ def existing_trial_count(export_path):
             doc = json.load(f)
         gs = doc.get("gossipsub") or []
         sp = doc.get("spread") or []
-        # Sanity check — both scenarios should have the same count.
-        if len(gs) != len(sp):
-            print(f"   ⚠️  mismatch in {export_path}: gossipsub={len(gs)} spread={len(sp)}; "
-                  f"using min for start_trial")
-            return min(len(gs), len(sp))
-        return len(gs)
+        dn = doc.get("dandelion") or []
+        # Collect only the arrays that were actually run (non-empty).
+        # Each run directory only stores the protocol(s) it ran, so a spread-only
+        # file has gs=[] and dn=[], and that is expected — not a mismatch.
+        non_empty = {k: v for k, v in [("gossipsub", gs), ("spread", sp), ("dandelion", dn)] if v}
+        if not non_empty:
+            return 0
+        counts = [len(v) for v in non_empty.values()]
+        if len(set(counts)) > 1:
+            names = ", ".join(f"{k}={len(v)}" for k, v in non_empty.items())
+            print(f"   ⚠️  mismatch in {export_path}: {names}; using min for start_trial")
+            return min(counts)
+        return counts[0]
     except Exception:
         return 0
 
@@ -261,22 +291,30 @@ def merge_extension(existing_path, extension_path):
 
     base_gs = base.get("gossipsub") or []
     base_sp = base.get("spread") or []
+    base_dn = base.get("dandelion") or []
     ext_gs  = ext.get("gossipsub")  or []
     ext_sp  = ext.get("spread")     or []
+    ext_dn  = ext.get("dandelion")  or []
 
     merged_gs = base_gs + ext_gs
     merged_sp = base_sp + ext_sp
+    merged_dn = base_dn + ext_dn
 
     base["gossipsub"] = merged_gs
     base["spread"]    = merged_sp
-    base["trials"]    = len(merged_gs)
+    base["dandelion"] = merged_dn
+    # trials reflects the longest non-empty scenario run
+    base["trials"] = max(len(merged_gs), len(merged_sp), len(merged_dn))
 
     gs_acc = recompute_attacker_accuracy(merged_gs)
     sp_acc = recompute_attacker_accuracy(merged_sp)
+    dn_acc = recompute_attacker_accuracy(merged_dn)
     if gs_acc is not None:
-        base["gossipsub_attacker_accuracy"] = gs_acc
+        base["gossipsub_attacker_accuracy"]  = gs_acc
     if sp_acc is not None:
-        base["spread_attacker_accuracy"]    = sp_acc
+        base["spread_attacker_accuracy"]     = sp_acc
+    if dn_acc is not None:
+        base["dandelion_attacker_accuracy"]  = dn_acc
 
     # Carry forward the extension's generated_at to reflect the latest touch.
     if "generated_at" in ext:
@@ -490,12 +528,14 @@ def main():
     simnet_cfg   = cfg["simnet"]
     gs_cfg       = cfg.get("gossipsub") or {}
     sp_cfg       = cfg.get("spread") or {}
+    dn_cfg       = cfg.get("dandelion") or {}
     extend       = bool(cfg.get("extend", False))
     trials       = int(simnet_cfg["trials"])
     num_nodes    = int(simnet_cfg["nodes"])
 
     gs_enabled = bool(gs_cfg.get("enabled"))
     sp_enabled = bool(sp_cfg.get("enabled"))
+    dn_enabled = bool(dn_cfg.get("enabled"))
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -528,9 +568,9 @@ def main():
         for i, topo_seed in enumerate(topologies, start=1):
             extra = {
                 **gs_env,
-                "SPREAD_SIMNET_SEED":        topo_seed,
-                "SPREAD_SIMNET_SKIP_SCENARIO": "spread",
-                "SPREAD_SIMNET_RUN_ID":      f"gs_{gs_subdir}_topo-{topo_seed}",
+                "SPREAD_SIMNET_SEED":          topo_seed,
+                "SPREAD_SIMNET_SKIP_SCENARIO": "spread,dandelion",
+                "SPREAD_SIMNET_RUN_ID":        f"gs_{gs_subdir}_topo-{topo_seed}",
             }
             dispatch_one(
                 label=f"gs {i}/{len(topologies)} seed={topo_seed}",
@@ -587,7 +627,7 @@ def main():
                     extra = {
                         **sp_extra_env,
                         "SPREAD_SIMNET_SEED":          topo_seed,
-                        "SPREAD_SIMNET_SKIP_SCENARIO": "gossipsub",
+                        "SPREAD_SIMNET_SKIP_SCENARIO": "gossipsub,dandelion",
                         "SPREAD_INTRA_RHO":            p_i,
                         "SPREAD_INTRA_FANOUT":         f_i,
                         "SPREAD_INTER_PROB":           p_e,
@@ -617,6 +657,40 @@ def main():
                         },
                         counters=counters,
                     )
+
+    # ---- Dandelion: one invocation per seed, similar to gossipsub ----
+    if dn_enabled:
+        dn_subdir = dandelion_subdir(dn_cfg)
+        dn_dir    = out_dir / "dandelion" / dn_subdir
+        dn_env    = dandelion_env(dn_cfg)
+        print(f"╔══════════════════════════════════════════════════════════════╗")
+        print(f"║  Dandelion baseline  ({dn_subdir})")
+        print(f"║  Topologies: {len(topologies)}   trials/run={trials}  nodes={num_nodes}")
+        print(f"║  Out: {dn_dir}")
+        print(f"╚══════════════════════════════════════════════════════════════╝")
+        for i, topo_seed in enumerate(topologies, start=1):
+            extra = {
+                **dn_env,
+                "SPREAD_SIMNET_SEED":          topo_seed,
+                "SPREAD_SIMNET_SKIP_SCENARIO": "gossipsub,spread",
+                "SPREAD_SIMNET_RUN_ID":        f"dn_{dn_subdir}_topo-{topo_seed}",
+            }
+            dispatch_one(
+                label=f"dn {i}/{len(topologies)} seed={topo_seed}",
+                repo_dir=repo_dir, target_dir=dn_dir, base_name=f"topo-{topo_seed}",
+                extra_env=extra, base_env=base_env, test_binary=test_binary,
+                trials=trials, extend=extend,
+                max_retries=args.max_retries, timeout_sec=args.timeout_sec,
+                results_log=results_log,
+                meta_extras={
+                    "kind":             "dandelion",
+                    "topology_seed":    topo_seed,
+                    "nodes":            num_nodes,
+                    "dandelion_fanout": dn_cfg.get("fanout"),
+                    "dandelion_prob":   dn_cfg.get("prob"),
+                },
+                counters=counters,
+            )
 
     elapsed_total = time.time() - t_start
     print()

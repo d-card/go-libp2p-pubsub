@@ -391,6 +391,18 @@ func WithSpreadPropagationConfig(cfg *SpreadConfig) Option {
 	}
 }
 
+// WithDandelionConfig configures DANDELION peer selection parameters.
+func WithDandelionConfig(cfg *DandelionGossipConfig) Option {
+	return func(ps *PubSub) error {
+		gs, ok := ps.rt.(*GossipSubRouter)
+		if !ok {
+			return fmt.Errorf("pubsub router is not gossipsub")
+		}
+		gs.dandelionGossip = NewDandelionGossip(cfg)
+		return nil
+	}
+}
+
 // WithPeerScore is a gossipsub router option that enables peer scoring.
 func WithPeerScore(params *PeerScoreParams, thresholds *PeerScoreThresholds) Option {
 	return func(ps *PubSub) error {
@@ -686,6 +698,9 @@ type GossipSubRouter struct {
 	spreadPropagation *SpreadPropagation
 	// Per-(topic, message ID) duplicate SPREAD re-propagation counters.
 	spreadRelayDuplicateCounter map[spreadDuplicateKey]int
+
+	// DANDELION propagation selector.
+	dandelionGossip *DandelionGossip
 }
 
 var _ BatchPublisher = &GossipSubRouter{}
@@ -1514,11 +1529,37 @@ func (gs *GossipSubRouter) rpcs(msg *Message) iter.Seq2[peer.ID, *RPC] {
 			}
 		}
 
+		// DANDELION: override peer selection with stem/fluff forwarding.
+		// Coin state is carried via msg.Spread (false=stem, true=fluff).
+		var dandelionNewCoin uint8
+		if gs.gossipProtocolChoice == DANDELION && gs.dandelionGossip != nil {
+			coin := uint8(0)
+			if msg.Spread {
+				coin = 1
+			}
+			selected, newCoin := gs.dandelionGossip.GetForwardingPeers(from, baseTosend, coin)
+			dandelionNewCoin = newCoin
+			dandelionTosend := make(map[peer.ID]struct{}, len(selected))
+			for _, p := range selected {
+				if p != from && p != peer.ID(msg.GetFrom()) {
+					dandelionTosend[p] = struct{}{}
+				}
+			}
+			if len(dandelionTosend) > 0 {
+				tosend = dandelionTosend
+			}
+		}
+
 		out := rpcWithMessages(msg.Message)
 		// Set RPC-level spread extension if both the router is configured to use
 		// SPREAD by default and the message explicitly requests spread.
 		if gs.gossipProtocolChoice == SPREAD && msg.Spread {
 			v := true
+			out.Spread = &pb.SpreadExtension{SourceIsSpreadNode: &v}
+		}
+		// Propagate Dandelion coin state via the SpreadExtension wire format.
+		if gs.gossipProtocolChoice == DANDELION && gs.dandelionGossip != nil {
+			v := dandelionNewCoin == 1
 			out.Spread = &pb.SpreadExtension{SourceIsSpreadNode: &v}
 		}
 		for pid := range tosend {

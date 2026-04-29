@@ -37,7 +37,9 @@ const (
 	SPREAD_SIMNET_ENABLE_CRASH_ENV          = "SPREAD_SIMNET_ENABLE_CRASH"
 	SPREAD_SIMNET_CRASH_PCT_ENV             = "SPREAD_SIMNET_CRASH_PCT"
 	SPREAD_SIMNET_START_TRIAL_ENV           = "SPREAD_SIMNET_START_TRIAL"
-	SPREAD_SIMNET_SKIP_SCENARIO_ENV         = "SPREAD_SIMNET_SKIP_SCENARIO" // "gossipsub" | "spread" | "" (run both)
+	SPREAD_SIMNET_SKIP_SCENARIO_ENV         = "SPREAD_SIMNET_SKIP_SCENARIO" // "gossipsub" | "spread" | "dandelion" | "" (run all)
+	DANDELION_FANOUT_ENV                    = "DANDELION_FANOUT"
+	DANDELION_PROB_ENV                      = "DANDELION_PROB"
 	GOSSIPSUB_D_ENV                         = "GOSSIPSUB_D"
 	GOSSIPSUB_D_LOW_ENV                     = "GOSSIPSUB_D_LOW"
 	GOSSIPSUB_D_HIGH_ENV                    = "GOSSIPSUB_D_HIGH"
@@ -140,9 +142,11 @@ type spreadExperimentExport struct {
 
 	Gossipsub []trialResult `json:"gossipsub"`
 	Spread    []trialResult `json:"spread"`
+	Dandelion []trialResult `json:"dandelion"`
 
-	GossipsubAttackerAccuracy []attackerAccuracySummary `json:"gossipsub_attacker_accuracy,omitempty"`
-	SpreadAttackerAccuracy    []attackerAccuracySummary `json:"spread_attacker_accuracy,omitempty"`
+	GossipsubAttackerAccuracy  []attackerAccuracySummary `json:"gossipsub_attacker_accuracy,omitempty"`
+	SpreadAttackerAccuracy     []attackerAccuracySummary `json:"spread_attacker_accuracy,omitempty"`
+	DandelionAttackerAccuracy  []attackerAccuracySummary `json:"dandelion_attacker_accuracy,omitempty"`
 }
 
 func TestSimnetSpreadVsGossipsubLatencyStretch(t *testing.T) {
@@ -152,15 +156,26 @@ func TestSimnetSpreadVsGossipsubLatencyStretch(t *testing.T) {
 	trials := envInt("SPREAD_SIMNET_TRIALS", SPREAD_SIMNET_TRIALS)
 	seed := int64(envInt("SPREAD_SIMNET_SEED", SPREAD_SIMNET_SEED))
 	startTrial := envInt(SPREAD_SIMNET_START_TRIAL_ENV, 0)
-	skipScenario := strings.ToLower(strings.TrimSpace(os.Getenv(SPREAD_SIMNET_SKIP_SCENARIO_ENV)))
-	if skipScenario != "" && skipScenario != "gossipsub" && skipScenario != "spread" {
-		t.Fatalf("%s must be empty, \"gossipsub\", or \"spread\"; got %q",
-			SPREAD_SIMNET_SKIP_SCENARIO_ENV, skipScenario)
+	// SPREAD_SIMNET_SKIP_SCENARIO accepts a comma-separated list of scenario names
+	// to skip, e.g. "gossipsub,dandelion" to run only spread.
+	skipRaw := strings.ToLower(strings.TrimSpace(os.Getenv(SPREAD_SIMNET_SKIP_SCENARIO_ENV)))
+	skipSet := map[string]bool{}
+	for _, s := range strings.Split(skipRaw, ",") {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			continue
+		}
+		if s != "gossipsub" && s != "spread" && s != "dandelion" {
+			t.Fatalf("%s: unknown scenario %q; valid values: gossipsub, spread, dandelion",
+				SPREAD_SIMNET_SKIP_SCENARIO_ENV, s)
+		}
+		skipSet[s] = true
 	}
-	runGossipsub := skipScenario != "gossipsub"
-	runSpread := skipScenario != "spread"
+	runGossipsub := !skipSet["gossipsub"]
+	runSpread    := !skipSet["spread"]
+	runDandelion := !skipSet["dandelion"]
 
-	var gsRes, spreadRes experimentResult
+	var gsRes, spreadRes, dandelionRes experimentResult
 	var nodeIDsForExport []int
 
 	// Run gossipsub
@@ -181,7 +196,7 @@ func TestSimnetSpreadVsGossipsubLatencyStretch(t *testing.T) {
 		nodeIDsForExport = gsTopo.nodeIDs
 		t.Logf("gossipsub: %d trials completed in %s", trials, time.Since(gossipsubStartTime))
 	} else {
-		t.Logf("gossipsub: SKIPPED via %s=gossipsub", SPREAD_SIMNET_SKIP_SCENARIO_ENV)
+		t.Logf("gossipsub: SKIPPED via %s", SPREAD_SIMNET_SKIP_SCENARIO_ENV)
 	}
 
 	// Run spread
@@ -204,17 +219,41 @@ func TestSimnetSpreadVsGossipsubLatencyStretch(t *testing.T) {
 		}
 		t.Logf("spread: %d trials completed in %s", trials, time.Since(spreadStartTime))
 	} else {
-		t.Logf("spread: SKIPPED via %s=spread", SPREAD_SIMNET_SKIP_SCENARIO_ENV)
+		t.Logf("spread: SKIPPED via %s", SPREAD_SIMNET_SKIP_SCENARIO_ENV)
+	}
+
+	// Run dandelion
+	if runDandelion {
+		dandelionStartTime := time.Now()
+		dandelionTopo := makeEthereumLikeTopology(t, nodeCount, seed)
+		defer dandelionTopo.closeFn()
+		dandelionRes = runScenario(t, dandelionTopo, scenarioConfig{
+			name:         "dandelion",
+			trials:       trials,
+			startTrial:   startTrial,
+			useDandelion: true,
+			enableCrash:  envBool(SPREAD_SIMNET_ENABLE_CRASH_ENV, false),
+			crashPct:     envFloat(SPREAD_SIMNET_CRASH_PCT_ENV, 0),
+		})
+		if nodeIDsForExport == nil {
+			nodeIDsForExport = dandelionTopo.nodeIDs
+		}
+		t.Logf("dandelion: %d trials completed in %s", trials, time.Since(dandelionStartTime))
+	} else {
+		t.Logf("dandelion: SKIPPED via %s=dandelion", SPREAD_SIMNET_SKIP_SCENARIO_ENV)
 	}
 
 	if runGossipsub {
-		t.Logf("gossipsub: %d raw observations", countDeliveries(gsRes))
+		t.Logf("gossipsub:  %d raw observations", countDeliveries(gsRes))
 	}
 	if runSpread {
-		t.Logf("spread:    %d raw observations", countDeliveries(spreadRes))
+		t.Logf("spread:     %d raw observations", countDeliveries(spreadRes))
+	}
+	if runDandelion {
+		t.Logf("dandelion:  %d raw observations", countDeliveries(dandelionRes))
 	}
 
-	if exportPath, err := maybeWriteSpreadExperimentExport(gsRes, spreadRes, nodeIDsForExport, nodeCount, trials, int(seed)); err != nil {
+	if exportPath, err := maybeWriteSpreadExperimentExport(gsRes, spreadRes, dandelionRes, nodeIDsForExport, nodeCount, trials, int(seed)); err != nil {
 		t.Fatalf("write %s: %v", SPREAD_SIMNET_EXPORT_PATH_ENV, err)
 	} else if exportPath != "" {
 		t.Logf("wrote spread experiment export to %s", exportPath)
@@ -234,6 +273,7 @@ type scenarioConfig struct {
 	trials           int
 	startTrial       int
 	useSpread        bool
+	useDandelion     bool
 	warmupEvery      int
 	warmupPerPublish int
 	enableCrash      bool
@@ -274,7 +314,7 @@ func runScenario(t *testing.T, topo experimentTopology, cfg scenarioConfig) expe
 	psubs := make([]*PubSub, 0, len(topo.hosts))
 	for _, h := range topo.hosts {
 		opts := append([]Option{}, baseOpts...)
-		// Add spread options if set
+		// Add protocol-specific options.
 		if cfg.useSpread {
 			vsvc := vivaldi.NewService(h, &vivaldi.Config{Timeout: 500 * time.Millisecond})
 			opts = append(opts,
@@ -283,6 +323,11 @@ func runScenario(t *testing.T, topo experimentTopology, cfg scenarioConfig) expe
 				WithSpreadClusteringConfig(spreadClusteringConfigFromEnv()),
 				WithSpreadPropagationConfig(spreadPropagationConfigFromEnv()),
 				WithVivaldi(vsvc, spreadVivaldiConfigFromEnv()),
+			)
+		} else if cfg.useDandelion {
+			opts = append(opts,
+				WithProtocolChoice(DANDELION),
+				WithDandelionConfig(dandelionConfigFromEnv()),
 			)
 		}
 		psubs = append(psubs, getGossipsub(ctx, h, opts...))
@@ -828,7 +873,7 @@ func makeEthereumLikeLatencyMatrix(t *testing.T, n int, seed int64) ([][]time.Du
 	return weights, nodeIDs
 }
 
-func buildSpreadExperimentExport(gsRes, spreadRes experimentResult, nodeIDs []int, nodeCount, trials, seed int) spreadExperimentExport {
+func buildSpreadExperimentExport(gsRes, spreadRes, dandelionRes experimentResult, nodeIDs []int, nodeCount, trials, seed int) spreadExperimentExport {
 	return spreadExperimentExport{
 		GeneratedAt:               time.Now().UTC().Format(time.RFC3339Nano),
 		Nodes:                     nodeCount,
@@ -841,8 +886,10 @@ func buildSpreadExperimentExport(gsRes, spreadRes experimentResult, nodeIDs []in
 		NodeIDs:                   nodeIDs,
 		Gossipsub:                 gsRes.trials,
 		Spread:                    spreadRes.trials,
-		GossipsubAttackerAccuracy: summarizeAttackerAccuracy(gsRes),
-		SpreadAttackerAccuracy:    summarizeAttackerAccuracy(spreadRes),
+		Dandelion:                 dandelionRes.trials,
+		GossipsubAttackerAccuracy:  summarizeAttackerAccuracy(gsRes),
+		SpreadAttackerAccuracy:     summarizeAttackerAccuracy(spreadRes),
+		DandelionAttackerAccuracy:  summarizeAttackerAccuracy(dandelionRes),
 	}
 }
 
@@ -905,15 +952,22 @@ func writeSpreadExperimentExport(path string, doc spreadExperimentExport) error 
 	return writeAtomicFile(path, b, 0o644)
 }
 
-func maybeWriteSpreadExperimentExport(gsRes, spreadRes experimentResult, nodeIDs []int, nodeCount, trials, seed int) (string, error) {
+func maybeWriteSpreadExperimentExport(gsRes, spreadRes, dandelionRes experimentResult, nodeIDs []int, nodeCount, trials, seed int) (string, error) {
 	exportPath := os.Getenv(SPREAD_SIMNET_EXPORT_PATH_ENV)
 	if exportPath == "" {
 		return "", nil
 	}
-	doc := buildSpreadExperimentExport(gsRes, spreadRes, nodeIDs, nodeCount, trials, seed)
+	doc := buildSpreadExperimentExport(gsRes, spreadRes, dandelionRes, nodeIDs, nodeCount, trials, seed)
 	doc.RunID = os.Getenv(SPREAD_SIMNET_RUN_ID_ENV)
 	doc.GitCommit = os.Getenv(SPREAD_SIMNET_GIT_COMMIT_ENV)
 	return exportPath, writeSpreadExperimentExport(exportPath, doc)
+}
+
+func dandelionConfigFromEnv() *DandelionGossipConfig {
+	return &DandelionGossipConfig{
+		FANOUT: envInt(DANDELION_FANOUT_ENV, DANDELION_FANOUT_DEFAULT),
+		PROB:   envFloat(DANDELION_PROB_ENV, DANDELION_PROB_DEFAULT),
+	}
 }
 
 func writeAtomicFile(path string, data []byte, perm os.FileMode) error {
