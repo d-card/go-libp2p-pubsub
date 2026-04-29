@@ -13,11 +13,28 @@
 # Example topologies filter:
 #   topologies: [1337, 1338, 1339, 1340, 1341, 1342, 1343, 1344, 1345, 1346]
 #
-# Optional: `gossipsub_d:` picks which gossipsub D-param subdir under
-# <sweep>/gossipsub/ to use for the baseline. Required only when multiple
-# d*_dl*_dh*/ exist; auto-picked if only one is present.
-# Example:
-#   gossipsub_d: {D: 6, D_low: 5, D_high: 12}
+# Optional: `gossipsub:` controls whether the GossipSub baseline is rendered and
+# which D-param subdir to read from (auto-picked if only one subdir exists).
+#   include: true      — show grey dashed baseline on all charts
+#   D: 6               — required only when multiple gossipsub/d*_dl*_dh*/ subdirs exist
+#   D_low: 6
+#   D_high: 6
+gossipsub:
+  include: true
+  # D: 6       # uncomment when multiple gossipsub subdirs exist
+  # D_low: 6
+  # D_high: 6
+
+# Optional: `dandelion:` controls whether the Dandelion baseline is rendered and
+# which fanout/prob subdir to read from (must match a dandelion/<subdir>/ that exists).
+#   include: true   — show orange diamond baseline on scatter/bar charts
+#   fanout: 6       — fluff-phase fanout used during the run
+#   prob: 0.8       — stem→fluff transition probability used during the run
+# Set include: false (or omit the section) to skip either baseline entirely.
+dandelion:
+  include: false
+  fanout: 6
+  prob: 0.8
 
 groups:
   A_Ce1.5:

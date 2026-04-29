@@ -11,8 +11,20 @@ simnet:
 gossipsub:
   enabled: true
   D: 6
-  D_low: 5
-  D_high: 12
+  D_low: 6
+  D_high: 6
+dandelion:
+  enabled: false   # set to true to run Dandelion baseline alongside spread
+  # Expected messages per relay node (two models):
+  #   Independent model (each node independently draws stem/fluff phase):
+  #     E = PROB * 1 + (1 - PROB) * FANOUT
+  #     For E=6: FANOUT = (6 - PROB) / (1 - PROB)
+  #       e.g. PROB=0.2 → FANOUT=7 (E≈5.8), PROB=0.3 → FANOUT=8 (E≈5.9)
+  #   Chain model (what the code implements — coin carried in message, PROB = stem→fluff transition prob):
+  #     E ≈ FANOUT  (for large N); exact: FANOUT - (FANOUT-1) / (N * PROB)
+  #     For E=6: set FANOUT=6 (PROB only affects anonymity/stem length, not bandwidth)
+  fanout: 6        # fluff-phase fanout (default 6)
+  prob: 0.8        # stem→fluff transition probability (chain model) / P(stem phase) (independent model)
 spread:
   enabled: true
   warmup_every: 0

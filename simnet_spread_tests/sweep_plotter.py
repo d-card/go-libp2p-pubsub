@@ -360,19 +360,30 @@ def build_global_gs_baseline(data_dir, attacker_pct, topology_filter=None,
     }
 
 
-def build_global_dn_baseline(data_dir, attacker_pct, topology_filter=None):
+def build_global_dn_baseline(data_dir, attacker_pct, topology_filter=None,
+                             fanout=None, prob=None):
     """Pool every dandelion delivery into one baseline across the sweep.
 
     Reads <data_dir>/dandelion/<subdir>/topo-*.json — one file per seed.
+    If fanout and prob are given, require the subdir fanout{N}_prob{P}; otherwise
+    auto-pick the first subdir found.
     Returns a dict with dn_stretch_*, dn_latency_*, dn_accuracy keys, or None.
     """
     dn_root = Path(data_dir) / "dandelion"
     if not dn_root.is_dir():
         return None
-    subdirs = [p for p in dn_root.iterdir() if p.is_dir()]
-    if not subdirs:
-        return None
-    dn_dir = subdirs[0]  # use first (only one expected per sweep)
+    if fanout is not None and prob is not None:
+        subdir_name = f"fanout{fanout}_prob{prob}"
+        dn_dir = dn_root / subdir_name
+        if not dn_dir.is_dir():
+            print(f"dandelion subdir {subdir_name!r} not found under {dn_root}",
+                  file=sys.stderr)
+            return None
+    else:
+        subdirs = [p for p in dn_root.iterdir() if p.is_dir()]
+        if not subdirs:
+            return None
+        dn_dir = subdirs[0]  # auto-pick (only one expected per sweep)
 
     stretch, latency, acc_vals = [], [], []
     acc_curve = defaultdict(list)
@@ -407,7 +418,7 @@ def build_global_dn_baseline(data_dir, attacker_pct, topology_filter=None):
         return float(np.percentile(values, p)) if values else None
 
     return {
-        "n_seeds":            len(subdirs),
+        "n_seeds":            1,
         "n_deliveries":       len(stretch),
         "dn_stretch_mean":    float(np.mean(stretch))   if stretch else None,
         "dn_stretch_median":  float(np.median(stretch)) if stretch else None,
@@ -716,15 +727,27 @@ def main():
     # means use every topo-*.json we find (current default behavior).
     topology_filter = plot_cfg.get("topologies") or None
 
-    # Optional: pick which gossipsub D-param subdir to use for the baseline.
-    # Required only when multiple gossipsub/d*_dl*_dh*/ exist under the sweep.
-    gossipsub_d = plot_cfg.get("gossipsub_d") or None
+    # Optional: gossipsub block — include flag + optional D-param subdir selection.
+    # Also accepts legacy flat keys include_gossipsub and gossipsub_d for back-compat.
+    gs_cfg = plot_cfg.get("gossipsub") or {}
+    include_gossipsub = gs_cfg.get("include", plot_cfg.get("include_gossipsub", True))
+    gossipsub_d = None
+    if {"D", "D_low", "D_high"} <= set(gs_cfg):
+        gossipsub_d = {k: gs_cfg[k] for k in ("D", "D_low", "D_high")}
+    elif plot_cfg.get("gossipsub_d"):
+        gossipsub_d = plot_cfg["gossipsub_d"]
     if gossipsub_d is not None:
         missing = {"D", "D_low", "D_high"} - set(gossipsub_d)
         if missing:
-            print(f"plot config error: gossipsub_d missing keys: {sorted(missing)}",
+            print(f"plot config error: gossipsub D params missing keys: {sorted(missing)}",
                   file=sys.stderr)
             sys.exit(2)
+
+    # Optional: Dandelion baseline — include flag + fanout/prob subdir selection.
+    dn_cfg = plot_cfg.get("dandelion") or {}
+    include_dandelion = dn_cfg.get("include", False)
+    dn_fanout = dn_cfg.get("fanout") or None
+    dn_prob   = dn_cfg.get("prob")   if "prob" in dn_cfg else None
 
     print(f"Loading data from: {data_dir}")
     print(f"Attacker pct:      {args.attacker_pct}")
@@ -740,22 +763,31 @@ def main():
                                topology_filter=topology_filter)
     print(f"Loaded metrics for {len(index)} configs.")
 
-    gs_baseline = build_global_gs_baseline(data_dir, args.attacker_pct,
-                                           topology_filter=topology_filter,
-                                           gossipsub_d=gossipsub_d)
-    if gs_baseline is not None:
-        print(f"Pooled gossipsub baseline: {gs_baseline['n_seeds']} seeds, "
-              f"{gs_baseline['n_deliveries']} deliveries")
+    if include_gossipsub:
+        gs_baseline = build_global_gs_baseline(data_dir, args.attacker_pct,
+                                               topology_filter=topology_filter,
+                                               gossipsub_d=gossipsub_d)
+        if gs_baseline is not None:
+            print(f"Pooled gossipsub baseline: {gs_baseline['n_seeds']} seeds, "
+                  f"{gs_baseline['n_deliveries']} deliveries")
+        else:
+            print("No gossipsub data found — baseline marker will be omitted.")
     else:
-        print("No gossipsub data found — baseline marker will be omitted.")
+        gs_baseline = None
+        print("GossipSub baseline disabled (include_gossipsub: false).")
 
-    dn_baseline = build_global_dn_baseline(data_dir, args.attacker_pct,
-                                           topology_filter=topology_filter)
-    if dn_baseline is not None:
-        print(f"Pooled dandelion baseline: {dn_baseline['n_seeds']} seeds, "
-              f"{dn_baseline['n_deliveries']} deliveries")
+    if include_dandelion:
+        dn_baseline = build_global_dn_baseline(data_dir, args.attacker_pct,
+                                               topology_filter=topology_filter,
+                                               fanout=dn_fanout, prob=dn_prob)
+        if dn_baseline is not None:
+            print(f"Pooled dandelion baseline: {dn_baseline['n_deliveries']} deliveries "
+                  f"(fanout={dn_fanout}, prob={dn_prob})")
+        else:
+            print("No dandelion data found — dandelion marker will be omitted.")
     else:
-        print("No dandelion data found — dandelion marker will be omitted.")
+        dn_baseline = None
+        print("Dandelion baseline disabled (dandelion.include: false).")
     print()
 
     print(f"Writing outputs to {out_dir}/")
